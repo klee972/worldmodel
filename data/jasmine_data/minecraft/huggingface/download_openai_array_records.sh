@@ -37,7 +37,9 @@ num_workers=64  # Number of parallel extraction processes
 start_time_uncompress=$(date +%s)
 
 # Find all shard tar files and extract them in parallel:
-xargs -0 -P $num_workers -I {} bash -c 'echo "Extracting {}"; tar -xf "{}" -C "'$final_dataset_dir'"'
+find "$hf_download_dir" -name "*.tar" -print0 | \
+xargs -0 -P $num_workers -I {} \
+bash -c 'echo "Extracting {}"; tar -xf "{}" -C "'$final_dataset_dir'"'
 
 end_time_uncompress=$(date +%s)
 

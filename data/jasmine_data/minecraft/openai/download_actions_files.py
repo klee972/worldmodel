@@ -7,9 +7,14 @@ from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
 
+
 @dataclass
 class Args:
-    index_file: str = "data/open_ai_index_files/all_6xx_Jun_29.json"
+    # index_file: str = "data/open_ai_index_files/all_6xx_Jun_29.json"
+    # index_file: str = "data/open_ai_index_files/all_7xx_Apr_6.json"
+    # index_file: str = "data/open_ai_index_files/all_8xx_Jun_29.json"
+    # index_file: str = "data/open_ai_index_files/all_9xx_Jun_29.json"
+    index_file: str = "data/open_ai_index_files/all_10xx_Jun_29.json"
     output_dir: str = "data/open_ai_minecraft_actions_files"
     num_workers: int = -1  # -1 means use all available cores
 
@@ -35,10 +40,15 @@ def download_file(args):
         jsonl_url = url.rsplit(".", 1)[0] + ".jsonl"
         filename = flatten_path(jsonl_url)
         output_file = os.path.join(output_dir, filename)
+        
+        # Skip if file already exists
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            return {"file": jsonl_url, "success": True, "skipped": True}
+        
         subprocess.run(
             ["wget", "-q", base_dir + jsonl_url, "-O", output_file], check=True
         )
-        return {"file": jsonl_url, "success": True}
+        return {"file": jsonl_url, "success": True, "skipped": False}
     except subprocess.CalledProcessError as e:
         # delete file if it exists
         if os.path.exists(output_file):
@@ -69,13 +79,14 @@ def download_actions_files(index_file: str, output_dir: str, num_workers: int):
     with open(os.path.join(output_dir, meta_data_file_name), "w") as f:
         json.dump(results, f)
 
-    # print number of failed downloads
-    failed_downloads = [result for result in results if not result["success"]]
-    print(f"Number of failed downloads: {len(failed_downloads)}")
-
-    # print number of successful downloads
-    successful_downloads = [result for result in results if result["success"]]
-    print(f"Number of successful downloads: {len(successful_downloads)}")
+    # Count statistics
+    failed = [r for r in results if not r["success"]]
+    skipped = [r for r in results if r["success"] and r.get("skipped", False)]
+    downloaded = [r for r in results if r["success"] and not r.get("skipped", False)]
+    
+    print(f"Downloaded: {len(downloaded)}")
+    print(f"Skipped (already exists): {len(skipped)}")
+    print(f"Failed: {len(failed)}")
 
 
 if __name__ == "__main__":

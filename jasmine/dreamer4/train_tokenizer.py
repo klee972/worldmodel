@@ -1,7 +1,8 @@
 import os
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.98")
-
+# Disable JAX's default GPU memory pre-allocation
+# This allows nvidia-smi to show actual memory usage
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 from dataclasses import dataclass, field
 from typing import cast, Optional
 
@@ -19,9 +20,10 @@ import tyro
 import wandb
 import grain
 import flax.nnx as nnx
+from jaxlpips import LPIPS
 
-from jasmine.models.tokenizer import TokenizerMAE
-from jasmine.utils.dataloader import get_dataloader
+from jasmine.models.dreamer4_models import TokenizerDreamer4
+from jasmine.utils.dataloader import get_dataloader, get_video_dataloader
 from jasmine.utils.train_utils import (
     get_lr_schedule,
     count_parameters_by_component,
@@ -29,20 +31,24 @@ from jasmine.utils.train_utils import (
     print_compiled_memory_stats,
     print_compiled_cost_analysis,
 )
+from jasmine.utils.dreamer4_utils import patchify, unpatchify
+
 
 
 @dataclass
 class Args:
     # Experiment
-    num_steps: int = 300_000
+    num_steps: int = 200_000
     seed: int = 0
-    seq_len: int = 16
+    seq_len: int = 64
     image_channels: int = 3
-    image_height: int = 64
-    image_width: int = 64
-    data_dir: str = ""
-    save_ckpt: bool = False
-    restore_ckpt: bool = False
+    image_height: int = 224
+    image_width: int = 384
+    # data_dir: str = "data/data/coinrun_episodes/train"
+    data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/train"
+    save_ckpt: bool = True
+    restore_ckpt: bool = True
+    restore_step: int = 19000
     # Optimization
     batch_size: int = 48
     init_lr: float = 0.0
@@ -55,44 +61,53 @@ class Args:
     warmup_steps: int = 10000
     # Tokenizer
     model_dim: int = 512
-    ffn_dim: int = 2048
+    mlp_ratio: int = 4
     latent_dim: int = 32
-    num_latents: int = 1024
+    num_latent_tokens: int = 16
+    time_every: int = 4
     patch_size: int = 16
-    num_blocks: int = 4
+    num_blocks: int = 12
     num_heads: int = 8
     dropout: float = 0.0
     max_mask_ratio: float = 0.9
     param_dtype = jnp.float32
     dtype = jnp.bfloat16
     use_flash_attention: bool = True
+    lpips_weight: float = 0.2
+    lpips_subsample_frac: float = 0.5
+    pos_emb_type: str = "rope"
     # Logging
-    log: bool = False
+    log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "train_tokenizer_mae"
-    tags: list[str] = field(default_factory=lambda: ["tokenizer", "mae"])
+    name: str = "tokenizer_dreamer4_minecraft"
+    tags: list[str] = field(default_factory=lambda: ["tokenizer", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/tokenizer"
+    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/minecraft/dreamer4/tokenizer"
     log_checkpoint_interval: int = 1000
     log_checkpoint_keep_period: int = 20_000
     log_gradients: bool = False
-    val_data_dir: str = ""
+    # val_data_dir: str = "data/data/coinrun_episodes/val"
+    val_data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/val"
     val_interval: int = 20_000
     val_steps: int = 50
     wandb_id: str = ""
 
 
-def build_model(args: Args, rng: jax.Array) -> tuple[TokenizerMAE, jax.Array]:
+
+def build_model(args: Args, rng: jax.Array) -> tuple[TokenizerDreamer4, jax.Array]:
     rng, _rng = jax.random.split(rng)
     rngs = nnx.Rngs(_rng)
-    tokenizer = TokenizerMAE(
+    tokenizer = TokenizerDreamer4(
         in_dim=args.image_channels,
+        image_height=args.image_height,
+        image_width=args.image_width,
         model_dim=args.model_dim,
-        ffn_dim=args.ffn_dim,
+        mlp_ratio=args.mlp_ratio,
         latent_dim=args.latent_dim,
-        num_latents=args.num_latents,
+        num_latent_tokens=args.num_latent_tokens,
+        time_every=args.time_every,
         patch_size=args.patch_size,
         num_blocks=args.num_blocks,
         num_heads=args.num_heads,
@@ -102,11 +117,12 @@ def build_model(args: Args, rng: jax.Array) -> tuple[TokenizerMAE, jax.Array]:
         dtype=args.dtype,
         use_flash_attention=args.use_flash_attention,
         rngs=rngs,
+        pos_emb_type=args.pos_emb_type,
     )
     return tokenizer, rng
 
 
-def build_optimizer(model: TokenizerMAE, args: Args) -> nnx.ModelAndOptimizer:
+def build_optimizer(model: TokenizerDreamer4, args: Args) -> nnx.ModelAndOptimizer:
     lr_schedule = get_lr_schedule(
         args.lr_schedule,
         args.init_lr,
@@ -154,20 +170,31 @@ def shard_optimizer_states(
 
 def build_dataloader(args: Args, data_dir: str) -> grain.DataLoaderIterator:
     image_shape = (args.image_height, args.image_width, args.image_channels)
-    array_record_files = [
-        os.path.join(data_dir, x)
-        for x in os.listdir(data_dir)
-        if x.endswith(".array_record")
-    ]
-    grain_dataloader = get_dataloader(
-        array_record_files,
+    # array_record_files = [
+    #     os.path.join(data_dir, x)
+    #     for x in os.listdir(data_dir)
+    #     if x.endswith(".array_record")
+    # ]
+    # grain_dataloader = get_dataloader(
+    #     array_record_files,
+    #     args.seq_len,
+    #     # NOTE: We deliberately pass the global batch size
+    #     # The dataloader shards the dataset across all processes
+    #     args.batch_size,
+    #     *image_shape,
+    #     num_workers=8,
+    #     prefetch_buffer_size=8,  # Increased for larger images to avoid data loading bottleneck
+    #     seed=args.seed,
+    # )
+    grain_dataloader = get_video_dataloader(
+        data_dir,
         args.seq_len,
         # NOTE: We deliberately pass the global batch size
         # The dataloader shards the dataset across all processes
         args.batch_size,
         *image_shape,
         num_workers=8,
-        prefetch_buffer_size=1,
+        prefetch_buffer_size=8,  # Increased for larger images to avoid data loading bottleneck
         seed=args.seed,
     )
     initial_state = grain_dataloader._create_initial_state()
@@ -245,13 +272,13 @@ def restore_checkpoint_if_needed(
         abstract_optimizer_state = nnx.state(abstract_optimizer)
         if val_iterator:
             restore_args = ocp.args.Composite(
-                model_state=ocp.args.PyTreeRestore(abstract_optimizer_state),  # type: ignore
+                model_state=ocp.args.PyTreeRestore(abstract_optimizer_state, partial_restore=True),  # type: ignore
                 train_dataloader_state=grain.checkpoint.CheckpointRestore(train_iterator),  # type: ignore
                 val_dataloader_state=grain.checkpoint.CheckpointRestore(val_iterator),  # type: ignore
             )
         else:
             restore_args = ocp.args.Composite(
-                model_state=ocp.args.PyTreeRestore(abstract_optimizer_state),  # type: ignore
+                model_state=ocp.args.PyTreeRestore(abstract_optimizer_state, partial_restore=True),  # type: ignore
                 train_dataloader_state=grain.checkpoint.CheckpointRestore(train_iterator),  # type: ignore
             )
         restored = checkpoint_manager.restore(restore_step, args=restore_args)
@@ -266,24 +293,7 @@ def restore_checkpoint_if_needed(
 
 
 def main(args: Args) -> None:
-    # Only initialize distributed if we're actually in a distributed environment
-    # Check if we're in SLURM or have explicit distributed config
-    is_slurm = "SLURM_JOB_ID" in os.environ and "SLURM_STEP_NODELIST" in os.environ
-    has_distributed_config = any(
-        key in os.environ
-        for key in ["JAX_COORDINATOR_ADDRESS", "JAX_PROCESS_COUNT", "JAX_PROCESS_ID"]
-    )
-    
-    if is_slurm or has_distributed_config:
-        jax.distributed.initialize()
-    else:
-        # For local single-machine multi-device setups, initialize with local backend
-        try:
-            jax.distributed.initialize()
-        except (KeyError, Exception) as e:
-            # If auto-detection fails (e.g., missing SLURM vars), continue with local setup
-            print(f"Note: Distributed initialization skipped ({type(e).__name__}), using local devices")
-
+    # jax.distributed.initialize()
     num_devices = jax.device_count()
     if num_devices == 0:
         raise ValueError("No JAX devices found.")
@@ -347,18 +357,54 @@ def main(args: Args) -> None:
 
     # --- Restore checkpoint ---
     step, optimizer, train_iterator, val_iterator = restore_checkpoint_if_needed(
-        args, checkpoint_manager, optimizer, train_iterator, val_iterator
+        args, checkpoint_manager, optimizer, train_iterator, val_iterator, args.restore_step,
     )
+
+    if args.lpips_weight > 0.0:
+        lpips_loss_fn = LPIPS(pretrained_network="alexnet")
+        def lpips_on_mae_recon(pred, target):
+            """
+            pred:    (B,T,H,W,C)
+            target:  (B,T,H,W,C)
+            Returns scalar LPIPS averaged over (B,T).
+            """
+            # Optional subsample frames over T to save compute
+            if args.lpips_subsample_frac < 1.0:
+                B, T = pred.shape[:2]
+                step = max(1, int(1.0/args.lpips_subsample_frac))
+                idx = jnp.arange(T)[::step]
+                pred = pred[:, idx]
+                target = target[:, idx]
+
+            # Rescale to [-1,1] for LPIPS
+            recon_lp = jnp.clip(pred * 2.0 - 1.0, -1.0, 1.0)
+            target_lp = jnp.clip(target * 2.0 - 1.0, -1.0, 1.0)
+
+            # Flatten B,T for a single LPIPS call: (B*T,H,W,C)
+            BT = recon_lp.shape[0] * recon_lp.shape[1]
+            H_, W_, C_ = recon_lp.shape[2], recon_lp.shape[3], recon_lp.shape[4]
+            recon_lp = recon_lp.reshape((BT, H_, W_, C_))
+            target_lp = target_lp.reshape((BT, H_, W_, C_))
+
+            # LPIPS returns per-example loss; average it
+            lp = lpips_loss_fn(recon_lp, target_lp)  # shape (BT,)
+            return jnp.mean(lp)
 
     # --- Define loss and train step (close over args) ---
     def tokenizer_loss_fn(
-        model: TokenizerMAE, inputs: dict, training: bool = False
+        model: TokenizerDreamer4, inputs: dict, training: bool = False
     ) -> tuple[jax.Array, tuple[jax.Array, dict]]:
         gt = jnp.asarray(inputs["videos"], dtype=jnp.float32) / 255.0
         inputs["videos"] = gt.astype(args.dtype)
         outputs = model(inputs, training=training)
         outputs["recon"] = outputs["recon"].astype(jnp.float32)
         mse = jnp.square(gt - outputs["recon"]).mean()
+
+        lpips_loss = 0.0
+        if args.lpips_weight > 0.0:
+            lpips_loss = lpips_on_mae_recon(outputs["recon"], gt)
+
+        loss = mse + args.lpips_weight * lpips_loss
 
         gt_clipped = gt.clip(0, 1).reshape(-1, *gt.shape[2:])
         recon = outputs["recon"].clip(0, 1).reshape(-1, *outputs["recon"].shape[2:])
@@ -367,19 +413,21 @@ def main(args: Args) -> None:
 
         metrics = dict(
             mse=mse,
+            lpips=lpips_loss,
             psnr=psnr,
             ssim=ssim,
-            loss=mse,
+            loss=loss,
         )
 
-        return mse, (outputs["recon"], metrics)
+        return loss, (outputs["recon"], metrics)
+
 
     @nnx.jit(donate_argnums=0)
     def train_step(
         optimizer: nnx.ModelAndOptimizer, inputs: dict
     ) -> tuple[jax.Array, jax.Array, dict]:
         def loss_fn(
-            model: TokenizerMAE,
+            model: TokenizerDreamer4,
         ) -> tuple[jax.Array, tuple[jax.Array, dict]]:
             model.train()
             return tokenizer_loss_fn(model, inputs, training=True)
@@ -399,7 +447,7 @@ def main(args: Args) -> None:
 
     @nnx.jit
     def val_step(
-        tokenizer: TokenizerMAE, inputs: dict
+        tokenizer: TokenizerDreamer4, inputs: dict
     ) -> tuple[jax.Array, jax.Array, dict]:
         tokenizer.eval()
         (loss, (recon, metrics)) = tokenizer_loss_fn(tokenizer, inputs, training=False)
@@ -443,6 +491,7 @@ def main(args: Args) -> None:
         }
         for elem in train_iterator
     )
+
     dataloader_val = None
     if val_iterator:
         dataloader_val = (

@@ -2,8 +2,16 @@
 *.npy
 *.png
 *.gif
+*.mp4
 
+zzz*
+data/coinrun_episodes/
+.venv/
+data/mc*/
+data/mine*/
+data/open_ai*/
 wandb_key
-checkpoints/
+ckpts/
+logs/
 wandb/
 __pycache__/

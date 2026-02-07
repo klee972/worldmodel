@@ -49,7 +49,7 @@ class Args:
     image_height: int = 64
     image_width: int = 64
     data_dir: str = ""
-    save_ckpt: bool = False
+    save_ckpt: bool = True
     restore_ckpt: bool = False
     # Optimization
     batch_size: int = 36
@@ -69,12 +69,12 @@ class Args:
     patch_size: int = 16
     tokenizer_num_blocks: int = 4
     tokenizer_num_heads: int = 8
-    tokenizer_checkpoint: str = ""
+    tokenizer_checkpoint: str = "/home/4bkang/rl/jasmine/ckpts/tokenizer"
     # LAM
     lam_dim: int = 512
     lam_ffn_dim: int = 2048
     latent_action_dim: int = 32
-    num_actions: int = 6
+    num_actions: int = 15 # 15 for coinrun
     lam_patch_size: int = 16
     lam_num_blocks: int = 4
     lam_num_heads: int = 8
@@ -85,21 +85,21 @@ class Args:
     dyna_num_blocks: int = 6
     dyna_num_heads: int = 8
     dropout: float = 0.0
-    diffusion_denoise_steps: int = 0
+    diffusion_denoise_steps: int = 64
     diffusion_use_ramp_weight: bool = True
     param_dtype = jnp.float32
     dtype = jnp.bfloat16
     use_flash_attention: bool = True
-    use_gt_actions: bool = False
+    use_gt_actions: bool = True
     # Logging
     log: bool = True
-    entity: str = ""
-    project: str = ""
+    entity: str = "4bkang"
+    project: str = "jasmine"
     name: str = "train_dynamics_diffusion"
     tags: list[str] = field(default_factory=lambda: ["dynamics", "diffusion"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = ""
+    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/dynamics_diffusion"
     log_checkpoint_interval: int = 5000
     log_checkpoint_keep_period: int = 20_000
     log_gradients: bool = False
@@ -371,7 +371,7 @@ def _calculate_step_metrics(
 
 
 def main(args: Args) -> None:
-    jax.distributed.initialize()
+    # jax.distributed.initialize()
     num_devices = jax.device_count()
     if num_devices == 0:
         raise ValueError("No JAX devices found.")
