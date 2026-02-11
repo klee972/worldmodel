@@ -34,9 +34,6 @@ from jasmine.utils.train_utils import (
 from jasmine.utils.dreamer4_utils import patchify, unpatchify
 
 
-
-
-
 @dataclass
 class Args:
     # Experiment
@@ -44,14 +41,14 @@ class Args:
     seed: int = 0
     seq_len: int = 64
     image_channels: int = 3
-    image_height: int = 224
-    image_width: int = 384
-    data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/train"
+    image_height: int = 64
+    image_width: int = 64
+    data_dir: str = "data/coinrun_episodes/train"
     save_ckpt: bool = True
     restore_ckpt: bool = False
     restore_step: int = 0
     # Optimization
-    batch_size: int = 32
+    batch_size: int = 16
     init_lr: float = 0.0
     max_lr: float = 3e-4
     decay_end: float = 0.0
@@ -59,17 +56,17 @@ class Args:
         30_000  # NOTE: wsd_decay_steps will only be used when using a wsd-schedule
     )
     lr_schedule: str = "wsd"  # supported options: wsd, cos
-    warmup_steps: int = 6000
-    optimizer: str = "adamw"  # supported options: adamw, muon
+    warmup_steps: int = 10000
+    optimizer: str = "muon"  # supported options: adamw, muon
     # Tokenizer
-    model_dim: int = 768
+    model_dim: int = 512
     mlp_ratio: int = 4
-    latent_dim: int = 64
-    num_latent_tokens: int = 32
+    latent_dim: int = 32
+    num_latent_tokens: int = 16
     time_every: int = 4
     patch_size: int = 16
-    num_blocks: int = 12
-    num_heads: int = 12
+    num_blocks: int = 4
+    num_heads: int = 8
     dropout: float = 0.0
     max_mask_ratio: float = 0.9
     param_dtype = jnp.float32
@@ -82,15 +79,15 @@ class Args:
     log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "tokenizer_dreamer4_minecraft"
+    name: str = "tokenizer_dreamer4_coinrun"
     tags: list[str] = field(default_factory=lambda: ["tokenizer", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/minecraft/dreamer4/tokenizer"
+    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/coinrun/dreamer4/tokenizer"
     log_checkpoint_interval: int = 1000
     log_checkpoint_keep_period: int = 20_000
     log_gradients: bool = False
-    val_data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/val"
+    val_data_dir: str = "data/coinrun_episodes/val"
     val_interval: int = 20_000
     val_steps: int = 50
     wandb_id: str = ""
@@ -185,24 +182,13 @@ def shard_optimizer_states(
 
 def build_dataloader(args: Args, data_dir: str) -> grain.DataLoaderIterator:
     image_shape = (args.image_height, args.image_width, args.image_channels)
-    # array_record_files = [
-    #     os.path.join(data_dir, x)
-    #     for x in os.listdir(data_dir)
-    #     if x.endswith(".array_record")
-    # ]
-    # grain_dataloader = get_dataloader(
-    #     array_record_files,
-    #     args.seq_len,
-    #     # NOTE: We deliberately pass the global batch size
-    #     # The dataloader shards the dataset across all processes
-    #     args.batch_size,
-    #     *image_shape,
-    #     num_workers=8,
-    #     prefetch_buffer_size=8,  # Increased for larger images to avoid data loading bottleneck
-    #     seed=args.seed,
-    # )
-    grain_dataloader = get_video_dataloader(
-        data_dir,
+    array_record_files = [
+        os.path.join(data_dir, x)
+        for x in os.listdir(data_dir)
+        if x.endswith(".array_record")
+    ]
+    grain_dataloader = get_dataloader(
+        array_record_files,
         args.seq_len,
         # NOTE: We deliberately pass the global batch size
         # The dataloader shards the dataset across all processes

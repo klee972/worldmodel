@@ -845,14 +845,15 @@ class TokenizerDreamer4(nnx.Module):
         B, T = z_BTNlL.shape[:2]
         z_BTNlM = self.latent_proj(z_BTNlL)
         query_tokens_repeated = einops.repeat(self.query_tokens.value, "N M -> B T N M", B=B, T=T)
-        z_BTSM = jnp.concatenate([query_tokens_repeated, z_BTNlM], axis=2)
+        z_BTSM = jnp.concatenate([z_BTNlM, query_tokens_repeated], axis=2)
         recon_BTSM = self.decoder(z_BTSM)
-        recon_BTNM = recon_BTSM[:, :, :-self.num_latent_tokens]
+        recon_BTNM = recon_BTSM[:, :, self.num_latent_tokens:]
         recon_BTNP = self.decoder_proj(recon_BTNM)
         recon_BTNP = recon_BTNP.astype(jnp.float32)
         recon_BTNP = nnx.sigmoid(recon_BTNP)
         recon_BTNP = recon_BTNP.astype(self.dtype)
         return unpatchify(recon_BTNP, self.patch_size, *video_hw)
+
 
 
 # =============================================================================
