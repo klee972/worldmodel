@@ -35,7 +35,6 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify
 
 
 
-
 @dataclass
 class Args:
     # Experiment
@@ -65,8 +64,10 @@ class Args:
     # Tokenizer
     model_dim: int = 768
     mlp_ratio: int = 4
-    latent_dim: int = 64
-    num_latent_tokens: int = 32
+    # latent_dim: int = 64
+    # num_latent_tokens: int = 32
+    latent_dim: int = 32
+    num_latent_tokens: int = 16
     time_every: int = 4
     patch_size: int = 16
     num_blocks: int = 12
@@ -174,13 +175,13 @@ def shard_optimizer_states(
     optimizer: nnx.ModelAndOptimizer, replicated_sharding: NamedSharding
 ) -> None:
     model_state = nnx.state(optimizer.model)
-    model_sharded_state = jax.lax.with_sharding_constraint(
-        model_state, replicated_sharding
+    model_sharded_state = jax.tree.map(
+        lambda x: jax.device_put(x, replicated_sharding), model_state
     )
     nnx.update(optimizer.model, model_sharded_state)
     optimizer_state = nnx.state(optimizer, nnx.optimizer.OptState)
-    optimizer_sharded_state = jax.lax.with_sharding_constraint(
-        optimizer_state, replicated_sharding
+    optimizer_sharded_state = jax.tree.map(
+        lambda x: jax.device_put(x, replicated_sharding), optimizer_state
     )
     nnx.update(optimizer, optimizer_sharded_state)
 
@@ -376,6 +377,10 @@ def main(args: Args) -> None:
     step, optimizer, train_iterator, val_iterator = restore_checkpoint_if_needed(
         args, checkpoint_manager, optimizer, train_iterator, val_iterator, args.restore_step,
     )
+    # Re-shard after restore: checkpoint may have been saved on a different number of
+    # devices, so restored tensors can have stale sharding that conflicts with freshly
+    # initialised tensors (e.g. attention masks) which already use the current topology.
+    shard_optimizer_states(optimizer, replicated_sharding)
 
     if args.lpips_weight > 0.0:
         lpips_loss_fn = LPIPS(pretrained_network="alexnet")

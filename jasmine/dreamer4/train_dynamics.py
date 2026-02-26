@@ -91,13 +91,13 @@ class Args:
     tokenizer_n_head: int = 12
     tokenizer_checkpoint: str = "/home/4bkang/rl/jasmine/ckpts/minecraft/dreamer4/tokenizer"
     # Dynamics
-    dyna_d_model: int = 1024
+    dyna_d_model: int = 1536
     dyna_packing_factor: int = 2
     dyna_d_spatial: int = 128  # must equal dyna_packing_factor * d_latent
     dyna_n_spatial: int = 16  # should be dyna_n_spatial * dyna_packing_factor = n_latent
     dyna_n_register: int = 4
     dyna_n_agent: int = 1
-    dyna_n_block: int = 16
+    dyna_n_block: int = 20
     dyna_n_head: int = 16
     dyna_k_max: int = 8
     batch_size_self: int = batch_size // 2
@@ -119,6 +119,7 @@ class Args:
     val_interval: int = 20_000
     val_steps: int = 50
     wandb_id: str = ""
+
 
 
 
@@ -1019,24 +1020,24 @@ def main(args: Args) -> None:
                             tag_recon = val_videos[f"{tag}_recon"]
                             tag_floor = val_videos[f"{tag}_floor"]
                             
-                            # Take first sample from batch
-                            gt_seq_val = tag_gt[0].clip(0, 1)
-                            recon_seq_val = tag_recon[0].clip(0, 1)
-                            floor_seq_val = tag_floor[0].clip(0, 1)
-                            
-                            # Create comparison: gt | recon | floor stacked vertically
-                            comparison = jnp.concatenate(
-                                (gt_seq_val, recon_seq_val, floor_seq_val), axis=1
-                            )
-                            comparison = einops.rearrange(
-                                comparison * 255, "t h w c -> h (t w) c"
-                            )
-                            
-                            # Store for logging
-                            val_video_logs[f"val/{tag}_gt"] = gt_seq_val
-                            val_video_logs[f"val/{tag}_recon"] = recon_seq_val
-                            val_video_logs[f"val/{tag}_floor"] = floor_seq_val
-                            val_video_logs[f"val/{tag}_comparison"] = comparison
+                            # Store per-sample comparisons (up to 4 samples)
+                            N_VIZ = min(8, tag_gt.shape[0])
+                            for b in range(N_VIZ):
+                                gt_b = tag_gt[b].clip(0, 1)
+                                recon_b = tag_recon[b].clip(0, 1)
+                                floor_b = tag_floor[b].clip(0, 1)
+                                comparison = jnp.concatenate(
+                                    (gt_b, recon_b, floor_b), axis=1
+                                )
+                                comparison = einops.rearrange(
+                                    comparison * 255, "t h w c -> h (t w) c"
+                                )
+                                val_video_logs[f"val/{tag}_comparison/{b}"] = comparison
+
+                            # Individual frame logs for first sample
+                            val_video_logs[f"val/{tag}_gt"] = tag_gt[0].clip(0, 1)
+                            val_video_logs[f"val/{tag}_recon"] = tag_recon[0].clip(0, 1)
+                            val_video_logs[f"val/{tag}_floor"] = tag_floor[0].clip(0, 1)
                     
                     # NOTE: Process-dependent control flow deliberately happens
                     # after indexing operation since it must not contain code

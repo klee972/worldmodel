@@ -327,6 +327,187 @@ class MLP(nnx.Module):
         return y
 
 
+class KVCacheAttention(nnx.Module):
+    """
+    Multi-head attention with KV-cache support for autoregressive temporal decoding.
+
+    Weight attribute names (query/key/value/out) match nnx.MultiHeadAttention for
+    checkpoint compatibility — the checkpoint restore will map params correctly.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        param_dtype: jnp.dtype,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs,
+        rope_fn: Optional[Callable] = None,
+        is_causal: bool = False,
+        use_flash_attention: bool = True,
+    ):
+        assert d_model % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.d_model = d_model
+        self.is_causal = is_causal
+        self.rope_fn = rope_fn
+        self.use_flash_attention = use_flash_attention
+        # Use LinearGeneral to match nnx.MultiHeadAttention checkpoint parameter shapes:
+        #   q/k/v: kernel (d_model, num_heads, head_dim), bias (num_heads, head_dim)
+        #   out:   kernel (num_heads, head_dim, d_model),  bias (d_model,)
+        kw = dict(param_dtype=param_dtype, dtype=dtype, rngs=rngs)
+        self.query = nnx.LinearGeneral(d_model, (self.num_heads, self.head_dim), **kw)
+        self.key   = nnx.LinearGeneral(d_model, (self.num_heads, self.head_dim), **kw)
+        self.value = nnx.LinearGeneral(d_model, (self.num_heads, self.head_dim), **kw)
+        self.out   = nnx.LinearGeneral((self.num_heads, self.head_dim), d_model, axis=(-2, -1), **kw)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _split(self, x: jax.Array) -> jax.Array:
+        """(..., T, D) -> (..., T, H, D_h)"""
+        return x.reshape(*x.shape[:-1], self.num_heads, self.head_dim)
+
+    def _merge(self, x: jax.Array) -> jax.Array:
+        """(..., T, H, D_h) -> (..., T, D)"""
+        return x.reshape(*x.shape[:-2], self.d_model)
+
+    def _dot_product_attn(
+        self,
+        q: jax.Array,   # (..., T_q, H, D_h)
+        k: jax.Array,   # (..., T_k, H, D_h)
+        v: jax.Array,   # (..., T_k, H, D_h)
+        is_causal: bool,
+    ) -> jax.Array:     # (..., T_q, H, D_h)
+        """Flatten batch dims, pad to multiple of 4, call dot_product_attention."""
+        orig = q.shape
+        T_q = q.shape[-3]
+        T_k = k.shape[-3]
+        impl = "cudnn" if self.use_flash_attention else None
+
+        def _flat(x):
+            return einops.rearrange(x, "... l h d -> (...) l h d")
+
+        def _pad(x, target):
+            return jnp.pad(x, ((0, 0), (0, target - x.shape[1]), (0, 0), (0, 0)))
+
+        Q_pad = ((T_q + 3) // 4) * 4
+        K_pad = ((T_k + 3) // 4) * 4
+
+        mask = jnp.ones((Q_pad, K_pad), dtype=jnp.bool_)
+        mask = mask.at[T_q:, :].set(False)
+        mask = mask.at[:, T_k:].set(False)
+
+        out = jax.nn.dot_product_attention(
+            query=_pad(_flat(q), Q_pad),
+            key=_pad(_flat(k), K_pad),
+            value=_pad(_flat(v), K_pad),
+            mask=mask[None, None],
+            is_causal=is_causal,
+            implementation=impl,
+        )  # (B_flat, Q_pad, H, D_h)
+        return out[:, :T_q].reshape(orig)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_kv(
+        self,
+        x: jax.Array,
+        positions: Optional[jax.Array] = None,
+    ) -> Tuple[jax.Array, jax.Array]:
+        """Compute K/V with RoPE applied. Used to populate the context KV cache.
+
+        x: (..., T_ctx, D)
+        Returns K, V each (..., T_ctx, H, D_h) with RoPE applied to K.
+        """
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+        if self.rope_fn is not None:
+            _, k = self.rope_fn(q, k, positions=positions)
+        return k, v
+
+    def __call__(
+        self,
+        x: jax.Array,
+        positions: Optional[jax.Array] = None,
+    ) -> jax.Array:
+        """Standard full-sequence forward pass (training and context-encode path).
+
+        x: (..., T, D)
+        Returns (..., T, D).
+        """
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+        if self.rope_fn is not None:
+            q, k = self.rope_fn(q, k, positions=positions)
+        out = self._dot_product_attn(q, k, v, is_causal=self.is_causal)
+        return self.out(out)
+
+    def call_with_ext_kv(
+        self,
+        x: jax.Array,
+        ext_kv: Tuple[jax.Array, jax.Array],
+        q_pos: int,
+    ) -> jax.Array:
+        """Decode a single future token using cached context K/V.
+
+        x:       (..., 1, D)   — the future token
+        ext_kv:  (K_ctx, V_ctx) each (..., T_ctx, H, D_h) — RoPE already applied to K_ctx
+        q_pos:   absolute temporal position of x (used for RoPE on Q and new K)
+        Returns: (..., 1, D)
+        """
+        q = self.query(x)   # (..., 1, H, D_h)
+        k = self.key(x)     # (..., 1, H, D_h)
+        v = self.value(x)   # (..., 1, H, D_h)
+
+        if self.rope_fn is not None:
+            positions = jnp.array([q_pos], dtype=jnp.int32)
+            q, k = self.rope_fn(q, k, positions=positions)
+
+        # Concatenate cached context K/V with this token's K/V
+        ext_k, ext_v = ext_kv
+        k_full = jnp.concatenate([ext_k, k], axis=-3)  # (..., T_ctx+1, H, D_h)
+        v_full = jnp.concatenate([ext_v, v], axis=-3)
+
+        # No causal mask: single Q attends to all T_ctx+1 K/V
+        out = self._dot_product_attn(q, k_full, v_full, is_causal=False)  # (..., 1, H, D_h)
+        return self.out(out)
+
+    def call_and_extend_kv(
+        self,
+        x: jax.Array,
+        ext_kv: Tuple[jax.Array, jax.Array],
+    ) -> Tuple[jax.Array, Tuple[jax.Array, jax.Array]]:
+        """Attend to ext_kv + return extended cache — all in one Q/K/V computation.
+
+        x:       (..., 1, D)  — new frame token
+        ext_kv:  (K_ctx, V_ctx) each (..., T_ctx, H, D_h)
+        q_pos is inferred from ext_kv length (= absolute temporal position of x).
+        Returns: (output (...,1,D), (extended_K, extended_V) each (...,T_ctx+1,H,D_h))
+        """
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+
+        ext_k, ext_v = ext_kv
+        q_pos = ext_k.shape[-3]          # absolute position of the new frame
+        if self.rope_fn is not None:
+            positions = jnp.array([q_pos], dtype=jnp.int32)
+            q, k = self.rope_fn(q, k, positions=positions)
+
+        k_full = jnp.concatenate([ext_k, k], axis=-3)   # (..., T_ctx+1, H, D_h)
+        v_full = jnp.concatenate([ext_v, v], axis=-3)
+
+        out = self._dot_product_attn(q, k_full, v_full, is_causal=False)
+        return self.out(out), (k_full, v_full)
+
+
 class ModalityAxialBlock(nnx.Module):
     """Spatial transformer block"""
 
@@ -484,20 +665,15 @@ class ModalityAxialBlock(nnx.Module):
                 dtype=self.param_dtype,  # rms norm in full precision
                 rngs=rngs,
             )
-            self.temporal_attention = nnx.MultiHeadAttention(
+            self.temporal_attention = KVCacheAttention(
+                d_model=self.dim,
                 num_heads=self.num_heads,
-                in_features=self.dim,
-                qkv_features=self.dim,
-                dropout_rate=self.dropout,
                 param_dtype=self.param_dtype,
                 dtype=self.dtype,
-                attention_fn=_create_flash_attention_fn(
-                    self.use_flash_attention, 
-                    is_causal=self.temporal_causal,
-                    rope_fn=self.temporal_rope_fn,
-                ),
                 rngs=rngs,
-                decode=self.decode,
+                rope_fn=self.temporal_rope_fn,
+                is_causal=self.temporal_causal,
+                use_flash_attention=self.use_flash_attention,
             )
 
         self.ffn_norm = nnx.RMSNorm(
@@ -516,7 +692,8 @@ class ModalityAxialBlock(nnx.Module):
 
 
     @nnx.remat
-    def __call__(self, x_BTNM: jax.Array) -> jax.Array:
+    def __call__(self, x_BTNM: jax.Array, temporal_kv=None):
+        # temporal_kv: None (standard) or (K_ctx, V_ctx) tuple (decode mode)
         # --- Spatial attention ---
         z_BTNM = self.spatial_norm(x_BTNM)
         z_BTNM = self.spatial_attention(z_BTNM, sow_weights=self.sow_weights)
@@ -526,7 +703,14 @@ class ModalityAxialBlock(nnx.Module):
             # --- Temporal attention ---
             x_BNTM = x_BTNM.swapaxes(1, 2)
             z_BNTM = self.temporal_norm(x_BNTM)
-            z_BNTM = self.temporal_attention(z_BNTM, sow_weights=self.sow_weights)
+            if temporal_kv is not None:
+                # Decode mode: x_BNTM is (B, N, 1, M) — only future token
+                T_ctx = temporal_kv[0].shape[-3]  # infer from cached K shape
+                z_BNTM = self.temporal_attention.call_with_ext_kv(
+                    z_BNTM, ext_kv=temporal_kv, q_pos=T_ctx
+                )
+            else:
+                z_BNTM = self.temporal_attention(z_BNTM)
             x_BNTM = x_BNTM + z_BNTM
             x_BTNM = x_BNTM.swapaxes(1, 2)
 
@@ -537,6 +721,51 @@ class ModalityAxialBlock(nnx.Module):
         if self.sow_activations:
             self.sow(nnx.Intermediate, "activations", x_BTNM)
         return x_BTNM
+
+    def call_and_cache(self, x_BTNM: jax.Array):
+        """Forward pass that also returns the temporal K/V for caching.
+        No gradient checkpointing — used only in encode_context (inference)."""
+        # --- Spatial attention ---
+        z_BTNM = self.spatial_norm(x_BTNM)
+        z_BTNM = self.spatial_attention(z_BTNM, sow_weights=self.sow_weights)
+        x_BTNM = x_BTNM + z_BTNM
+
+        kv = None
+        if (self.layer_index + 1) % self.time_every == 0:
+            # --- Temporal attention ---
+            x_BNTM = x_BTNM.swapaxes(1, 2)
+            z_BNTM = self.temporal_norm(x_BNTM)
+            kv = self.temporal_attention.get_kv(z_BNTM)
+            z_BNTM = self.temporal_attention(z_BNTM)
+            x_BNTM = x_BNTM + z_BNTM
+            x_BTNM = x_BNTM.swapaxes(1, 2)
+
+        # --- Feedforward ---
+        z_BTNM = self.ffn_norm(x_BTNM)
+        z_BTNM = self.mlp(z_BTNM)
+        x_BTNM = x_BTNM + z_BTNM
+        return x_BTNM, kv
+
+    def extend_kv_cache(self, x_B1NM: jax.Array, kv_entry):
+        """Process a single new frame and extend the temporal KV cache by 1 entry.
+        No gradient checkpointing — inference only."""
+        # --- Spatial attention ---
+        z = self.spatial_norm(x_B1NM)
+        z = self.spatial_attention(z, sow_weights=self.sow_weights)
+        x_B1NM = x_B1NM + z
+
+        new_kv = kv_entry  # non-temporal blocks keep None unchanged
+        if (self.layer_index + 1) % self.time_every == 0:
+            x_B1NM_T = x_B1NM.swapaxes(1, 2)          # (B, N, 1, M)
+            z_normed = self.temporal_norm(x_B1NM_T)
+            z_out, new_kv = self.temporal_attention.call_and_extend_kv(z_normed, kv_entry)
+            x_B1NM_T = x_B1NM_T + z_out
+            x_B1NM = x_B1NM_T.swapaxes(1, 2)
+
+        # --- Feedforward ---
+        z = self.ffn_norm(x_B1NM)
+        x_B1NM = x_B1NM + self.mlp(z)
+        return x_B1NM, new_kv
 
 
 class ModalityAxialTransformer(nnx.Module):
@@ -638,17 +867,40 @@ class ModalityAxialTransformer(nnx.Module):
             )
 
 
-    def __call__(self, x_BTNM: jax.Array) -> jax.Array:
+    def __call__(self, x_BTNM: jax.Array, *, kv_cache=None) -> jax.Array:
         x_BTNM = self.input_norm(x_BTNM)
         # Apply sinusoidal PE only if using that type (RoPE is applied inside attention)
         if self.pos_enc is not None:
             x_BTNM = self.pos_enc(x_BTNM)
-        for block in self.blocks:
-            x_BTNM = block(x_BTNM)
+        for i, block in enumerate(self.blocks):
+            block_kv = kv_cache[i] if kv_cache is not None else None
+            x_BTNM = block(x_BTNM, temporal_kv=block_kv)
 
         if self.sow_logits:
             self.sow(nnx.Intermediate, "logits", x_BTNM)
         return x_BTNM
+
+    def compute_kv_cache(self, x_BTNM: jax.Array) -> list:
+        """Context-only forward pass; returns K/V per block (None for non-temporal blocks)."""
+        x_BTNM = self.input_norm(x_BTNM)
+        if self.pos_enc is not None:
+            x_BTNM = self.pos_enc(x_BTNM)
+        kv_cache = []
+        for block in self.blocks:
+            x_BTNM, kv = block.call_and_cache(x_BTNM)
+            kv_cache.append(kv)
+        return kv_cache
+
+    def extend_kv_cache(self, x_B1NM: jax.Array, kv_cache: list) -> list:
+        """Process 1 new frame through all blocks, appending new K/V to each block's cache.
+        Requires pos_emb_type='rope' (sinusoidal PE not supported for incremental extension)."""
+        x_B1NM = self.input_norm(x_B1NM)
+        assert self.pos_enc is None, "extend_kv_cache requires pos_emb_type='rope'"
+        new_cache = []
+        for i, block in enumerate(self.blocks):
+            x_B1NM, new_kv = block.extend_kv_cache(x_B1NM, kv_cache[i])
+            new_cache.append(new_kv)
+        return new_cache
 
 
 class TokenizerDreamer4(nnx.Module):
@@ -1670,19 +1922,28 @@ class DynamicsDreamer4(nnx.Module):
 
     def __call__(
         self,
-        actions: jnp.ndarray,            # (B,T) - or whatever expected shape
+        actions: jnp.ndarray,            # (B,T) - or (B,2) in decode mode (see kv_cache note)
         step_idxs: jnp.ndarray,          # (B,T) - time step d idxs
         signal_idxs: jnp.ndarray,        # (B,T) - step size τ idxs
         packed_enc_tokens: jnp.ndarray,  # (B,T,n_s,d_spatial)
         *,
         agent_tokens: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
+        kv_cache=None,
     ):
+        # When kv_cache is not None (decode mode), packed_enc_tokens is (B,1,...) and
+        # actions must be (B,2) = concat([a_{T_ctx-1}, a_curr]) so that after shift-by-one
+        # encoding, position 1 carries emb(a_{T_ctx-1}).  We then slice to keep only that.
         spatial_tokens = self.spatial_proj(packed_enc_tokens) # (B, T, n_spatial, d_model)
 
-        action_tokens = self.action_encoder(actions)
+        action_tokens = self.action_encoder(actions)          # (B, T_or_2, 1, d_model)
 
         B, T = spatial_tokens.shape[:2]
+
+        if kv_cache is not None:
+            # Decode mode: keep only the last action token (emb of a_{T_ctx-1})
+            action_tokens = action_tokens[:, -1:, :, :]      # (B, 1, 1, d_model)
+
         register_tokens = jnp.broadcast_to(
             self.register_tokens.value[None, None, ...], # (1,1,n_register,d_model)
             (B, T, self.n_register, self.d_model),
@@ -1697,19 +1958,89 @@ class DynamicsDreamer4(nnx.Module):
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens]
         else:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
-        
+
         tokens = jnp.concatenate(toks, axis=2) # (B,T,S,D)
-        
-        x = self.transformer(tokens)
+
+        x = self.transformer(tokens, kv_cache=kv_cache)
 
         spatial_tokens_out = x[:, :, self.spatial_slice, :]
         x1_hat = self.flow_x_head(spatial_tokens_out)
-        
+
         h_t = None
         if self.n_agent > 0:
             h_t = x[:, :, self.agent_slice, :]
-            
+
         return x1_hat, h_t
+
+    def encode_context(
+        self,
+        actions_ctx: jnp.ndarray,           # (B, T_ctx)
+        step_idxs_ctx: jnp.ndarray,         # (B, T_ctx)
+        signal_idxs_ctx: jnp.ndarray,       # (B, T_ctx)
+        packed_ctx: jnp.ndarray,            # (B, T_ctx, n_spatial, d_spatial)
+        *,
+        agent_tokens_ctx: Optional[jnp.ndarray] = None,
+    ) -> list:
+        """Context-only forward pass; returns KV cache (list of per-block K/V or None)."""
+        spatial_tokens = self.spatial_proj(packed_ctx)
+        action_tokens = self.action_encoder(actions_ctx)
+
+        B, T = spatial_tokens.shape[:2]
+        register_tokens = jnp.broadcast_to(
+            self.register_tokens.value[None, None, ...],
+            (B, T, self.n_register, self.d_model),
+        )
+
+        step_tok = self.step_embed(step_idxs_ctx)[:, :, None, :]
+        signal_tok = self.signal_embed(signal_idxs_ctx)[:, :, None, :]
+
+        if self.n_agent > 0:
+            if agent_tokens_ctx is None:
+                agent_tokens_ctx = jnp.zeros((B, T, self.n_agent, self.d_model), dtype=spatial_tokens.dtype)
+            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens_ctx]
+        else:
+            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
+
+        tokens = jnp.concatenate(toks, axis=2)
+        return self.transformer.compute_kv_cache(tokens)
+
+    def extend_kv_cache(
+        self,
+        actions_new: jnp.ndarray,          # (B, 2) = [a_{t-1}, a_t] for shift trick
+        step_idxs_new: jnp.ndarray,        # (B, 1)
+        signal_idxs_new: jnp.ndarray,      # (B, 1)
+        packed_new: jnp.ndarray,           # (B, 1, n_spatial, d_spatial)
+        kv_cache: list,
+        *,
+        agent_tokens_new: Optional[jnp.ndarray] = None,
+    ) -> list:
+        """Encode 1 new frame and append its K/V to the existing cache.
+
+        actions_new: pass [a_{t-1}, a_t] (B,2); after shift-by-one encoding,
+                     position 1 = emb(a_{t-1}), sliced via [:,-1:] to get the
+                     correct action embedding for this frame.
+        Returns updated kv_cache list with each block's K/V extended by 1 frame.
+        """
+        spatial_tokens = self.spatial_proj(packed_new)                      # (B, 1, n_spatial, D)
+        action_tokens = self.action_encoder(actions_new)[:, -1:, :, :]     # shift trick → (B,1,1,D)
+
+        B = spatial_tokens.shape[0]
+        register_tokens = jnp.broadcast_to(
+            self.register_tokens.value[None, None, ...],
+            (B, 1, self.n_register, self.d_model),
+        )
+        step_tok   = self.step_embed(step_idxs_new)[:, :, None, :]
+        signal_tok = self.signal_embed(signal_idxs_new)[:, :, None, :]
+
+        if self.n_agent > 0:
+            if agent_tokens_new is None:
+                agent_tokens_new = jnp.zeros((B, 1, self.n_agent, self.d_model), dtype=spatial_tokens.dtype)
+            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens_new]
+        else:
+            toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
+
+        tokens = jnp.concatenate(toks, axis=2)  # (B, 1, S_per_t, D)
+        return self.transformer.extend_kv_cache(tokens, kv_cache)
 
 
 class TaskEmbedder(nnx.Module):
