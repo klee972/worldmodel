@@ -58,7 +58,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--image_path", type=str,
-        default="/home/4bkang/rl/jasmine/wandb/run-20260224_065640-6gwkpub8/files/media/images/val/shortcut_d4_pure_AR_comparison_419_1efff643456107031fcb.png",
+        default="/home/4bkang/rl/jasmine/wandb/run-20260227_134155-phbmkqti/files/media/images/val/shortcut_d4_pure_AR_comparison_1259_d84e94f025f47dd4c132.png",
         help="입력 PNG 이미지 경로",
     )
     parser.add_argument("--output", "-o", type=str, default="comparison.mp4", help="출력 MP4 경로")
@@ -66,7 +66,7 @@ if __name__ == "__main__":
     parser.add_argument("--row_b", type=int, default=1, help="오른쪽에 올 row (0-indexed)")
     parser.add_argument("--cols", type=int, default=64, help="가로 프레임 수")
     parser.add_argument("--rows", type=int, default=3, help="세로 프레임 수")
-    parser.add_argument("--fps", type=int, default=20, help="출력 FPS")
+    parser.add_argument("--fps", type=int, default=10, help="출력 FPS")
     args = parser.parse_args()
 
     extract_comparison_video(
@@ -78,4 +78,3 @@ if __name__ == "__main__":
         n_rows=args.rows,
         fps=args.fps,
     )
-

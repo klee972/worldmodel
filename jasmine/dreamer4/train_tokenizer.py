@@ -64,10 +64,8 @@ class Args:
     # Tokenizer
     model_dim: int = 768
     mlp_ratio: int = 4
-    # latent_dim: int = 64
-    # num_latent_tokens: int = 32
-    latent_dim: int = 32
-    num_latent_tokens: int = 16
+    latent_dim: int = 64
+    num_latent_tokens: int = 32
     time_every: int = 4
     patch_size: int = 16
     num_blocks: int = 12

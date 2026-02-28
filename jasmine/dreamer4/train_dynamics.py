@@ -45,6 +45,7 @@ from jasmine.dreamer4.sampler import sample_video, SamplerConfig
 from jasmine.utils.dreamer4_utils import patchify, unpatchify, pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck
 
 
+
 @dataclass
 class Args:
     # Experiment
@@ -57,7 +58,6 @@ class Args:
     data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/train"
     save_ckpt: bool = True
     restore_ckpt: bool = False
-    shift_action_tokens_by_one: bool = True
     # Optimization
     batch_size: int = 32
     init_lr: float = 0.0
@@ -99,10 +99,11 @@ class Args:
     dyna_n_agent: int = 1
     dyna_n_block: int = 20
     dyna_n_head: int = 16
-    dyna_k_max: int = 8
+    dyna_k_max: int = 64
     batch_size_self: int = batch_size // 2
     seq_len_short: int = 16       # short branch T; ignored when seq_len_ratio == 0.0
     seq_len_ratio: float = 0.75    # fraction of batch assigned to short branch (0.0 = disabled)
+    ctx_length: int = 1  # num. gt frames given when validating
     # Logging
     log: bool = True
     entity: str = "4bkang"
@@ -116,8 +117,8 @@ class Args:
     log_checkpoint_keep_period: int = 10_000
     log_gradients: bool = False
     val_data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/val"
-    val_interval: int = 20_000
-    val_steps: int = 50
+    val_interval: int = 10_000
+    val_steps: int = 5
     wandb_id: str = ""
 
 
@@ -171,7 +172,6 @@ def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, Dynamics
         param_dtype=args.param_dtype,
         use_flash_attention=args.use_flash_attention,
         rngs=rngs,
-        shift_action_tokens_by_one=args.shift_action_tokens_by_one,
         pos_emb_type=args.pos_emb_type,
     )
     return tokenizer, dynamics
@@ -432,7 +432,7 @@ def _calculate_step_metrics(
 def _eval_regimes_for_realism(cfg, *, ctx_length: int):
     common = dict(
         dyna_k_max=cfg.dyna_k_max,
-        horizon=min(32, cfg.seq_len - ctx_length),
+        horizon=cfg.seq_len - cfg.ctx_length,
         ctx_length=ctx_length,
         ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
         image_height=cfg.image_height, image_width=cfg.image_width, image_channels=cfg.image_channels, patch_size=cfg.patch_size,
@@ -444,7 +444,6 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         # match_ctx_tau=False,
     )
     regs = []
-    regs.append(("finest_pure_AR", SamplerConfig(schedule="finest", **common)))
     regs.append(("shortcut_d4_pure_AR", SamplerConfig(schedule="shortcut", d=1/4, **common)))
     return regs
 
@@ -477,7 +476,7 @@ def _compute_branch_inputs(
     B: int,
     T: int,
     B_self: int,
-    key_sigma: jnp.ndarray,
+    key_tau: jnp.ndarray,
     key_step_self: jnp.ndarray,
     key_noise: jnp.ndarray,
     k_max: int,
@@ -501,39 +500,39 @@ def _compute_branch_inputs(
     d_self, step_idx_self = _sample_step_excluding_dmin(key_step_self, (B_self, T), k_max, dtype=dtype)
     step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)  # (B, T)
 
-    sigma_full, sigma_idx_full = _sample_tau_for_step(key_sigma, (B, T), k_max, step_idx_full, dtype=dtype)
-    sigma_emp = sigma_full[:B_emp]
-    sigma_self = sigma_full[B_emp:]
-    sigma_idx_self_arr = sigma_idx_full[B_emp:]
+    tau_full, tau_idx_full = _sample_tau_for_step(key_tau, (B, T), k_max, step_idx_full, dtype=dtype)
+    tau_emp = tau_full[:B_emp]
+    tau_self = tau_full[B_emp:]
+    tau_idx_self_arr = tau_idx_full[B_emp:]
 
     z0_full = jax.random.normal(key_noise, z1.shape, dtype=z1.dtype)
-    z_tilde_full = (1.0 - sigma_full)[..., None, None] * z0_full + sigma_full[..., None, None] * z1
+    z_tilde_full = (1.0 - tau_full)[..., None, None] * z0_full + tau_full[..., None, None] * z1
     z_tilde_self = z_tilde_full[B_emp:]
 
-    w_emp = 0.9 * sigma_emp + 0.1
-    w_self = 0.9 * sigma_self + 0.1
+    w_emp = 0.9 * tau_emp + 0.1
+    w_self = 0.9 * tau_self + 0.1
 
     d_half = d_self / 2.0
     step_idx_half = step_idx_self + 1
-    sigma_plus = sigma_self + d_half
-    sigma_idx_plus = sigma_idx_self_arr + (k_max * d_half).astype(jnp.int32)
+    tau_plus = tau_self + d_half
+    tau_idx_plus = tau_idx_self_arr + (k_max * d_half).astype(jnp.int32)
 
     return dict(
         z1=z1,
         actions=inputs["actions"],
         B_emp=B_emp,
         step_idx_full=step_idx_full,
-        sigma_idx_full=sigma_idx_full,
+        tau_idx_full=tau_idx_full,
         z_tilde_full=z_tilde_full,
         z_tilde_self=z_tilde_self,
         w_emp=w_emp,
         w_self=w_self,
-        sigma_self=sigma_self,
-        sigma_idx_self=sigma_idx_self_arr,
+        tau_self=tau_self,
+        tau_idx_self=tau_idx_self_arr,
         d_half=d_half,
         step_idx_half=step_idx_half,
-        sigma_plus=sigma_plus,
-        sigma_idx_plus=sigma_idx_plus,
+        tau_plus=tau_plus,
+        tau_idx_plus=tau_idx_plus,
     )
 
 
@@ -546,20 +545,20 @@ def _make_branch_loss_fn(branch: dict, B: int, B_self: int, bootstrap_start, ste
     actions_full = branch["actions"]
     B_emp = branch["B_emp"]
     step_idx_full = branch["step_idx_full"]
-    sigma_idx_full = branch["sigma_idx_full"]
+    tau_idx_full = branch["tau_idx_full"]
     z_tilde_full = branch["z_tilde_full"]
     z_tilde_self = branch["z_tilde_self"]
     w_emp = branch["w_emp"]
     w_self = branch["w_self"]
-    sigma_self = branch["sigma_self"]
-    sigma_idx_self = branch["sigma_idx_self"]
+    tau_self = branch["tau_self"]
+    tau_idx_self = branch["tau_idx_self"]
     d_half = branch["d_half"]
     step_idx_half = branch["step_idx_half"]
-    sigma_plus = branch["sigma_plus"]
-    sigma_idx_plus = branch["sigma_idx_plus"]
+    tau_plus = branch["tau_plus"]
+    tau_idx_plus = branch["tau_idx_plus"]
 
     def loss_and_aux(dynamics: "DynamicsDreamer4"):
-        z1_hat_full, _ = dynamics(actions_full, step_idx_full, sigma_idx_full, z_tilde_full)
+        z1_hat_full, _ = dynamics(actions_full, step_idx_full, tau_idx_full, z_tilde_full)
         z1_hat_emp = z1_hat_full[:B_emp]
         z1_hat_self = z1_hat_full[B_emp:]
 
@@ -568,14 +567,14 @@ def _make_branch_loss_fn(branch: dict, B: int, B_self: int, bootstrap_start, ste
 
         do_boot = (B_self > 0) & (step >= bootstrap_start)
 
-        z1_hat_half1, _ = dynamics(actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self)
-        b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[..., None, None]
+        z1_hat_half1, _ = dynamics(actions_full[B_emp:], step_idx_half, tau_idx_self, z_tilde_self)
+        b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - tau_self)[..., None, None]
         z_prime = z_tilde_self + b_prime * d_half[..., None, None]
-        z1_hat_half2, _ = dynamics(actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime)
-        b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[..., None, None]
-        vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[..., None, None]
+        z1_hat_half2, _ = dynamics(actions_full[B_emp:], step_idx_half, tau_idx_plus, z_prime)
+        b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - tau_plus)[..., None, None]
+        vhat_tau = (z1_hat_self - z_tilde_self) / (1.0 - tau_self)[..., None, None]
         vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-        boot_per = (1.0 - sigma_self) ** 2 * jnp.mean((vhat_sigma - vbar_target) ** 2, axis=(2, 3))
+        boot_per = (1.0 - tau_self) ** 2 * jnp.mean((vhat_tau - vbar_target) ** 2, axis=(2, 3))
         boot_loss_raw = jnp.mean(boot_per * w_self)
         boot_mse_raw = jnp.mean(boot_per)
 
@@ -714,11 +713,11 @@ def main(args: Args) -> None:
         execute one fused path to keep a single jit and stable shapes).
         """
         step_key = jax.random.fold_in(master_key, step)
-        _, key_sigma, key_step_self, key_noise, _ = jax.random.split(step_key, 5)
+        _, key_tau, key_step_self, key_noise, _ = jax.random.split(step_key, 5)
 
         branch = _compute_branch_inputs(
             tokenizer, inputs, B, T, B_self,
-            key_sigma, key_step_self, key_noise,
+            key_tau, key_step_self, key_noise,
             args.dyna_k_max, args.dtype, args.dyna_n_spatial, args.dyna_packing_factor,
         )
         loss_fn = _make_branch_loss_fn(branch, B, B_self, bootstrap_start, step)
@@ -793,14 +792,13 @@ def main(args: Args) -> None:
             )
         return loss, z1_hat, metrics
 
-    @nnx.jit
     def val_step(dynamics: DynamicsDreamer4, tokenizer: TokenizerDreamer4, inputs: dict) -> dict:
         """Evaluate model and compute metrics"""
         dynamics.eval()
         gt = jnp.asarray(inputs["videos"], dtype=jnp.float32) / 255.0
         actions = inputs["actions"]
         
-        ctx_length = min(32, args.seq_len - 1)
+        ctx_length = min(args.ctx_length, args.seq_len - 1)
         regimes = _eval_regimes_for_realism(args, ctx_length=ctx_length)
 
         val_output = {}
@@ -830,67 +828,62 @@ def main(args: Args) -> None:
         return val_output
 
     def calculate_validation_metrics(val_dataloader, dynamics, tokenizer, rng):
-        """
-        For each tag, calculate means for latency, mse, psnr.
-        Also return video frames (gt, floor, recon) for each tag.
-        
-        Returns:
-            val_metrics: dict with keys like "{tag}_latency", "{tag}_mse", "{tag}_psnr"
-            val_videos: dict with keys like "{tag}_recon", "{tag}_gt", "{tag}_floor"
-        """
-        # Get tags from regimes
-        ctx_length = min(args.seq_len // 2, args.seq_len - 1)
+        ctx_length = min(args.ctx_length, args.seq_len - 1)
         regimes = _eval_regimes_for_realism(args, ctx_length=ctx_length)
         tags = [tag for tag, _ in regimes]
-        
-        # Accumulators per tag
+
+        N_VIZ = 10
         metrics_accum = {tag: {"latency": [], "mse": [], "psnr": []} for tag in tags}
-        last_videos = {tag: {"recon": None, "gt": None, "floor": None} for tag in tags}
-        
+        viz_gt    = {tag: [] for tag in tags}
+        viz_recon = {tag: [] for tag in tags}
+        viz_floor = {tag: [] for tag in tags}
+
         val_step_count = 0
         for batch in val_dataloader:
             val_outputs = val_step(dynamics, tokenizer, batch)
-            
-            # Accumulate metrics for each tag
+
             for tag in tags:
                 metrics_accum[tag]["latency"].append(val_outputs[f"{tag}_latency"])
                 metrics_accum[tag]["mse"].append(val_outputs[f"{tag}_mse"])
                 metrics_accum[tag]["psnr"].append(val_outputs[f"{tag}_psnr"])
-                # Keep last batch's videos for visualization
-                last_videos[tag]["recon"] = val_outputs[f"{tag}_recon"]
-                last_videos[tag]["gt"] = val_outputs[f"{tag}_gt"]
-                last_videos[tag]["floor"] = val_outputs[f"{tag}_floor"]
-            
+                needed = N_VIZ - sum(a.shape[0] for a in viz_gt[tag])
+                if needed > 0:
+                    tag_gt    = np.asarray(val_outputs[f"{tag}_gt"])
+                    tag_recon = np.asarray(val_outputs[f"{tag}_recon"])
+                    tag_floor = np.asarray(val_outputs[f"{tag}_floor"])
+                    take = min(needed, tag_gt.shape[0])
+                    viz_gt[tag].append(tag_gt[:take])
+                    viz_recon[tag].append(tag_recon[:take])
+                    viz_floor[tag].append(tag_floor[:take])
+
             val_step_count += 1
             if val_step_count >= args.val_steps:
                 break
-        
-        # Compute mean metrics for each tag
+
         val_metrics = {}
         for tag in tags:
             val_metrics[f"{tag}_latency"] = np.mean(metrics_accum[tag]["latency"])
             val_metrics[f"{tag}_mse"] = np.mean(metrics_accum[tag]["mse"])
             val_metrics[f"{tag}_psnr"] = np.mean(metrics_accum[tag]["psnr"])
-        
-        # Flatten videos dict for easier access
+
         val_videos = {}
         for tag in tags:
-            val_videos[f"{tag}_recon"] = last_videos[tag]["recon"]
-            val_videos[f"{tag}_gt"] = last_videos[tag]["gt"]
-            val_videos[f"{tag}_floor"] = last_videos[tag]["floor"]
-        
+            val_videos[f"{tag}_gt"]    = np.concatenate(viz_gt[tag],    axis=0)[:N_VIZ] if viz_gt[tag]    else None
+            val_videos[f"{tag}_recon"] = np.concatenate(viz_recon[tag], axis=0)[:N_VIZ] if viz_recon[tag] else None
+            val_videos[f"{tag}_floor"] = np.concatenate(viz_floor[tag], axis=0)[:N_VIZ] if viz_floor[tag] else None
+
         return val_metrics, val_videos, tags
 
     def _stack_actions(ac: dict) -> np.ndarray:
         """Convert {"buttons": (B,T-1), "camera": (B,T-1)} → (B,T,2).
 
-        The dataloader yields T-1 actions for T frames.  Since the dynamics
-        model is trained with shift_action_tokens_by_one=True, it expects
-        shape (B, T, 2) and drops the last position internally.  We pad one
-        dummy zero action at the end to satisfy that shape requirement.
+        The dataloader yields T-1 actions for T frames.  Shifting is now done
+        here (outside the encoder): prepend a sentinel row of -1 so that
+        frame 0 has no previous action, frame 1 gets a0, etc.
         """
-        stacked = np.stack([ac["buttons"], ac["camera"]], axis=-1)  # (B, T-1, 2)
-        return np.pad(stacked, ((0, 0), (0, 1), (0, 0)))            # (B, T,   2)
+        stacked = np.stack([ac["buttons"], ac["camera"]], axis=-1)        # (B, T-1, 2)
+        sentinel = np.full((stacked.shape[0], 1, 2), -1, dtype=stacked.dtype)
+        return np.concatenate([sentinel, stacked], axis=1)               # (B, T,   2)
 
     # --- TRAIN LOOP ---
     def _make_sharded_batch(elem):
@@ -1015,30 +1008,30 @@ def main(args: Args) -> None:
                         val_videos = val_results["videos"]
                         val_tags = val_results["tags"]
                         for tag in val_tags:
-                            # Get videos for this tag (shape: B, T, H, W, C)
-                            tag_gt = val_videos[f"{tag}_gt"]
-                            tag_recon = val_videos[f"{tag}_recon"]
-                            tag_floor = val_videos[f"{tag}_floor"]
-                            
-                            # Store per-sample comparisons (up to 4 samples)
-                            N_VIZ = min(8, tag_gt.shape[0])
-                            for b in range(N_VIZ):
-                                gt_b = tag_gt[b].clip(0, 1)
-                                recon_b = tag_recon[b].clip(0, 1)
-                                floor_b = tag_floor[b].clip(0, 1)
-                                comparison = jnp.concatenate(
-                                    (gt_b, recon_b, floor_b), axis=1
-                                )
-                                comparison = einops.rearrange(
-                                    comparison * 255, "t h w c -> h (t w) c"
-                                )
-                                val_video_logs[f"val/{tag}_comparison/{b}"] = comparison
+                            tag_gt    = val_videos[f"{tag}_gt"]    # (N, T, H, W, C) float32
+                            tag_recon = val_videos[f"{tag}_recon"] # (N, T, H, W, C) float32
+                            tag_floor = val_videos[f"{tag}_floor"] # (N, T, H, W, C) float32
 
-                            # Individual frame logs for first sample
-                            val_video_logs[f"val/{tag}_gt"] = tag_gt[0].clip(0, 1)
-                            val_video_logs[f"val/{tag}_recon"] = tag_recon[0].clip(0, 1)
-                            val_video_logs[f"val/{tag}_floor"] = tag_floor[0].clip(0, 1)
-                    
+                            if tag_gt is None or tag_recon is None:
+                                continue
+
+                            # Per-sample images (first sample, last frame)
+                            val_video_logs[f"val/{tag}_gt"]    = tag_gt[0]
+                            val_video_logs[f"val/{tag}_recon"] = tag_recon[0]
+                            if tag_floor is not None:
+                                val_video_logs[f"val/{tag}_floor"] = tag_floor[0]
+
+                            # Per-sample GT|recon side-by-side videos (no floor)
+                            N = tag_gt.shape[0]
+                            for b in range(N):
+                                gt_b    = np.clip(tag_gt[b],    0.0, 1.0)
+                                recon_b = np.clip(tag_recon[b], 0.0, 1.0)
+                                # (T, H, W*2, C) → (T, C, H, W*2) uint8 for wandb.Video
+                                side_by_side = np.concatenate([gt_b, recon_b], axis=2)
+                                side_by_side = (side_by_side * 255).astype(np.uint8)
+                                side_by_side = np.transpose(side_by_side, (0, 3, 1, 2))
+                                val_video_logs[f"val/{tag}_video/{b}"] = side_by_side
+
                     # NOTE: Process-dependent control flow deliberately happens
                     # after indexing operation since it must not contain code
                     # sections that lead to cross-accelerator communication.
@@ -1050,20 +1043,17 @@ def main(args: Args) -> None:
                                 np.asarray(comparison_seq.astype(np.uint8))
                             ),
                         }
-                        
-                        # Add validation images for each tag
+
                         for key, video in val_video_logs.items():
-                            if "comparison" in key:
-                                # Comparison is already a grid image
-                                log_images[key] = wandb.Image(
-                                    np.asarray(video.astype(np.uint8))
-                                )
+                            if "_video/" in key:
+                                # (T, H, W*2, C) uint8 → wandb.Video
+                                log_images[key] = wandb.Video(video, fps=20, format="mp4")
                             else:
-                                # Individual frame (last frame of sequence)
+                                # Individual frame: last frame of sequence
                                 log_images[key] = wandb.Image(
-                                    np.asarray(video[args.seq_len - 1])
+                                    np.clip(np.asarray(video[args.seq_len - 1]) * 255, 0, 255).astype(np.uint8)
                                 )
-                        
+
                         wandb.log(log_images)
             # --- Checkpointing ---
             if args.save_ckpt and step % args.log_checkpoint_interval == 0:

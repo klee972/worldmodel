@@ -10,185 +10,187 @@ from flax import nnx
 from jasmine.models.dreamer4_models import DynamicsDreamer4
 
 
-def test_kv_cache_correctness():
-    # Small model — depth=8 with time_every=4 → 2 temporal attention layers
-    B, T_ctx = 2, 4
-    d_model   = 64
-    n_spatial = 4
-    d_spatial = 32
-    n_actions = 8
-    depth     = 8
-    time_every = 4
-    n_heads   = 4
-    k_max     = 8
+# ── Shared model configuration ─────────────────────────────────────────────────
+def _make_models(decode_infer: bool = True):
+    """Return (train_model, infer_model) sharing the same initial weights.
 
-    rngs = nnx.Rngs(params=0, dropout=1)
-    model = DynamicsDreamer4(
-        d_model=d_model,
-        d_spatial=d_spatial,
-        n_spatial=n_spatial,
+    Both models are created from rngs seeded with the same value.  Because the
+    decode flag only changes the forward path (not weight shapes or init order),
+    the parameters are numerically identical.
+    """
+    kw = dict(
+        d_model=64,
+        d_spatial=32,
+        n_spatial=4,
         n_register=2,
         n_agent=0,
-        n_heads=n_heads,
-        n_actions=n_actions,
-        depth=depth,
-        k_max=k_max,
-        rngs=rngs,
-        time_every=time_every,
+        n_heads=4,
+        n_actions=8,
+        depth=8,
+        k_max=8,
+        time_every=4,
         pos_emb_type="rope",
-        shift_action_tokens_by_one=True,
     )
+    train_model = DynamicsDreamer4(
+        decode=False, rngs=nnx.Rngs(params=0, dropout=1), **kw
+    )
+    infer_model = DynamicsDreamer4(
+        decode=decode_infer, rngs=nnx.Rngs(params=0, dropout=1), **kw
+    )
+    return train_model, infer_model
+
+
+def _fill_context(model, actions_ctx, z_ctx, e, sig_clean):
+    """Fill the model's KV cache frame-by-frame.
+
+    Shifting is done here: frame t gets a_{t-1}, frame 0 gets sentinel -1.
+    actions_ctx is the original (unshifted) context action sequence.
+    """
+    B, T_ctx = actions_ctx.shape
+    step_idx_1 = jnp.full((B, 1), e, dtype=jnp.int32)
+    sig_idx_1  = jnp.full((B, 1), sig_clean, dtype=jnp.int32)
+
+    sentinel = jnp.full((B, 1), -1, dtype=actions_ctx.dtype)
+    shifted  = jnp.concatenate([sentinel, actions_ctx[:, :-1]], axis=1)  # (B, T_ctx)
+    for t in range(T_ctx):
+        model(shifted[:, t:t+1], step_idx_1, sig_idx_1, z_ctx[:, t:t+1], deterministic=True)
+        model.advance_cache()
+
+
+# ── Test 1: frame-by-frame decode == full-sequence ─────────────────────────────
+def test_kv_cache_correctness():
+    B, T_ctx = 2, 4
+    n_spatial, d_spatial, n_actions, k_max = 4, 32, 8, 8
+    e = 0
+    sig_clean = k_max - 1
+
+    train_model, infer_model = _make_models()
 
     key = jax.random.PRNGKey(42)
-    k1, k2, k3, k4 = jax.random.split(key, 4)
+    k1, k3, k4 = jax.random.split(key, 3)
 
-    actions_ctx  = jax.random.randint(k1, (B, T_ctx), 0, n_actions)
-    action_curr  = jax.random.randint(k2, (B, 1),     0, n_actions)
-    z_ctx        = jax.random.normal(k3, (B, T_ctx, n_spatial, d_spatial))
-    z_t          = jax.random.normal(k4, (B, 1,     n_spatial, d_spatial))
+    actions_ctx = jax.random.randint(k1, (B, T_ctx), 0, n_actions)
+    z_ctx       = jax.random.normal(k3, (B, T_ctx, n_spatial, d_spatial))
+    z_t         = jax.random.normal(k4, (B, 1,     n_spatial, d_spatial))
 
-    e = 0  # step_idx for d=1/k_max (finest)
     step_idx_ctx = jnp.full((B, T_ctx), e,         dtype=jnp.int32)
     step_idx_fut = jnp.full((B, 1),     e,         dtype=jnp.int32)
-    sig_ctx      = jnp.full((B, T_ctx), k_max - 1, dtype=jnp.int32)
-    sig_fut      = jnp.full((B, 1),     k_max - 1, dtype=jnp.int32)
+    sig_ctx      = jnp.full((B, T_ctx), sig_clean, dtype=jnp.int32)
+    sig_fut      = jnp.full((B, 1),     sig_clean, dtype=jnp.int32)
 
-    # ── Full-sequence path ──────────────────────────────────────────────
-    actions_full  = jnp.concatenate([actions_ctx, action_curr], axis=1)   # (B, T_ctx+1)
+    # ── Full-sequence reference ──────────────────────────────────────────────
+    # Shift externally: [-1, a0, ..., a_{T_ctx-1}] for T_ctx+1 frames
+    sentinel      = jnp.full((B, 1), -1, dtype=actions_ctx.dtype)
+    actions_full  = jnp.concatenate([sentinel, actions_ctx], axis=1)  # (B, T_ctx+1)
     step_idx_full = jnp.concatenate([step_idx_ctx, step_idx_fut], axis=1)
     sig_full      = jnp.concatenate([sig_ctx, sig_fut], axis=1)
-    z_seq         = jnp.concatenate([z_ctx, z_t], axis=1)                 # (B, T_ctx+1, ...)
+    z_seq         = jnp.concatenate([z_ctx, z_t], axis=1)
 
-    x1_hat_full, _ = model(actions_full, step_idx_full, sig_full, z_seq)
-    ref = x1_hat_full[:, -1:, :, :]   # (B, 1, n_spatial, d_spatial)
+    x1_hat_full, _ = train_model(actions_full, step_idx_full, sig_full, z_seq,
+                                 deterministic=True)
+    ref = x1_hat_full[:, -1:, :, :]  # (B, 1, n_spatial, d_spatial)
 
-    # ── KV-cache path ───────────────────────────────────────────────────
-    kv_cache = model.encode_context(actions_ctx, step_idx_ctx, sig_ctx, z_ctx)
+    # ── KV-cache path ────────────────────────────────────────────────────────
+    infer_model.init_cache(B, T_ctx + 1)
+    _fill_context(infer_model, actions_ctx, z_ctx, e, sig_clean)
 
-    # Pass [a_{T_ctx-1}, a_curr] so after shift-by-one, pos 1 = emb(a_{T_ctx-1})
-    actions_for_decode = jnp.concatenate([actions_ctx[:, -1:], action_curr], axis=1)
-    x1_hat_kv, _ = model(
-        actions_for_decode, step_idx_fut, sig_fut, z_t,
-        kv_cache=kv_cache,
+    # Future frame's action token = a_{T_ctx-1} = actions_ctx[:, -1]
+    x1_hat_kv, _ = infer_model(
+        actions_ctx[:, -1:], step_idx_fut, sig_fut, z_t, deterministic=True
     )
 
-    # ── Compare ─────────────────────────────────────────────────────────
+    # ── Compare ──────────────────────────────────────────────────────────────
     max_diff = float(jnp.max(jnp.abs(x1_hat_kv - ref)))
     print(f"  max |kv_cache - full_seq|: {max_diff:.3e}")
     assert max_diff < 1e-4, f"FAILED: outputs diverge (max_diff={max_diff:.3e})"
     print("  PASSED")
 
 
+# ── Test 2: incremental decode (rolling cache) == fresh fill from scratch ──────
 def test_extend_kv_cache_correctness():
-    """extend_kv_cache(ctx) + decode(frame t+1) must match full-seq encode_context(ctx+t+1) + decode."""
-    B, T_ctx, H = 2, 4, 3   # H = number of horizon frames to test
-    d_model   = 64
-    n_spatial = 4
-    d_spatial = 32
-    n_actions = 8
-    depth     = 8
-    time_every = 4
-    n_heads   = 4
-    k_max     = 8
+    """Running the decode model frame-by-frame automatically extends the cache.
 
-    rngs = nnx.Rngs(params=0, dropout=1)
-    model = DynamicsDreamer4(
-        d_model=d_model,
-        d_spatial=d_spatial,
-        n_spatial=n_spatial,
-        n_register=2,
-        n_agent=0,
-        n_heads=n_heads,
-        n_actions=n_actions,
-        depth=depth,
-        k_max=k_max,
-        rngs=rngs,
-        time_every=time_every,
-        pos_emb_type="rope",
-        shift_action_tokens_by_one=True,
-    )
+    For each horizon frame t, the prediction from the incrementally-extended
+    cache must match a prediction from a freshly initialised cache that is
+    filled with all context + the first t future frames from scratch.
+    """
+    B, T_ctx, H = 2, 4, 3
+    n_spatial, d_spatial, n_actions, k_max = 4, 32, 8, 8
+    e = 0
+    sig_clean = k_max - 1
 
     key = jax.random.PRNGKey(99)
     keys = jax.random.split(key, 10)
 
-    e = 0
-    sig_clean = k_max - 1
-
     actions_ctx = jax.random.randint(keys[0], (B, T_ctx), 0, n_actions)
-    z_ctx       = jax.random.normal(keys[1], (B, T_ctx, n_spatial, d_spatial))
+    z_ctx       = jax.random.normal(keys[1],  (B, T_ctx, n_spatial, d_spatial))
 
-    # Generate H future frames and actions
-    future_actions = [jax.random.randint(keys[2+i], (B, 1), 0, n_actions) for i in range(H)]
-    future_z       = [jax.random.normal(keys[2+H+i], (B, 1, n_spatial, d_spatial)) for i in range(H)]
+    future_actions = [jax.random.randint(keys[2 + i],     (B, 1), 0, n_actions)
+                      for i in range(H)]
+    future_z       = [jax.random.normal(keys[2 + H + i],  (B, 1, n_spatial, d_spatial))
+                      for i in range(H)]
 
-    # ── Incremental (extend_kv_cache) path ─────────────────────────────
-    kv_cache = model.encode_context(
-        actions_ctx,
-        jnp.full((B, T_ctx), e, dtype=jnp.int32),
-        jnp.full((B, T_ctx), sig_clean, dtype=jnp.int32),
-        z_ctx,
+    step_idx_1 = jnp.full((B, 1), e,         dtype=jnp.int32)
+    sig_idx_1  = jnp.full((B, 1), sig_clean, dtype=jnp.int32)
+
+    kw = dict(
+        d_model=64,
+        d_spatial=d_spatial,
+        n_spatial=n_spatial,
+        n_register=2,
+        n_agent=0,
+        n_heads=4,
+        n_actions=n_actions,
+        depth=8,
+        k_max=k_max,
+        time_every=4,
+        pos_emb_type="rope",
+        decode=True,
     )
 
-    inc_ctx_actions = actions_ctx
+    # ── Incremental path ─────────────────────────────────────────────────────
+    infer_model = DynamicsDreamer4(rngs=nnx.Rngs(params=0, dropout=1), **kw)
+    infer_model.init_cache(B, T_ctx + H)
+    _fill_context(infer_model, actions_ctx, z_ctx, e, sig_clean)
+
     inc_preds = []
+    prev_act_fut = actions_ctx[:, -1:]   # a_{T_ctx-1}: action token for frame T_ctx
     for t in range(H):
-        action_curr = future_actions[t]
-        z_t         = future_z[t]
+        pred, _ = infer_model(prev_act_fut, step_idx_1, sig_idx_1, future_z[t],
+                              deterministic=True)
+        infer_model.advance_cache()
+        inc_preds.append(pred)
+        prev_act_fut = future_actions[t]  # a_{T_ctx+t}: action token for next frame
 
-        # Decode using current growing cache
-        actions_for_decode = jnp.concatenate([inc_ctx_actions[:, -1:], action_curr], axis=1)
-        x1_hat_inc, _ = model(
-            actions_for_decode,
-            jnp.full((B, 1), e, dtype=jnp.int32),
-            jnp.full((B, 1), sig_clean, dtype=jnp.int32),
-            z_t,
-            kv_cache=kv_cache,
-        )
-        inc_preds.append(x1_hat_inc)
+    # ── Reference path (fresh init_cache before each frame) ──────────────────
+    # Use a separate model object with the same initial weights (same seed).
+    ref_model = DynamicsDreamer4(rngs=nnx.Rngs(params=0, dropout=1), **kw)
 
-        # Extend cache with z_t (simulating the denoised frame being appended)
-        actions_for_extend = jnp.concatenate([inc_ctx_actions[:, -1:], action_curr], axis=1)
-        kv_cache = model.extend_kv_cache(
-            actions_for_extend,
-            jnp.full((B, 1), e, dtype=jnp.int32),
-            jnp.full((B, 1), sig_clean, dtype=jnp.int32),
-            z_t,
-            kv_cache,
-        )
-        inc_ctx_actions = jnp.concatenate([inc_ctx_actions, action_curr], axis=1)
-
-    # ── Reference (encode_context from scratch each time) path ─────────
-    ref_ctx_actions = actions_ctx
-    ref_ctx_z       = z_ctx
     ref_preds = []
     for t in range(H):
-        action_curr = future_actions[t]
-        z_t         = future_z[t]
+        # Reset the cache completely.
+        ref_model.init_cache(B, T_ctx + H)
 
-        T_ref = ref_ctx_z.shape[1]
-        kv_ref = model.encode_context(
-            ref_ctx_actions,
-            jnp.full((B, T_ref), e, dtype=jnp.int32),
-            jnp.full((B, T_ref), sig_clean, dtype=jnp.int32),
-            ref_ctx_z,
-        )
-        actions_for_decode = jnp.concatenate([ref_ctx_actions[:, -1:], action_curr], axis=1)
-        x1_hat_ref, _ = model(
-            actions_for_decode,
-            jnp.full((B, 1), e, dtype=jnp.int32),
-            jnp.full((B, 1), sig_clean, dtype=jnp.int32),
-            z_t,
-            kv_cache=kv_ref,
-        )
-        ref_preds.append(x1_hat_ref)
-        ref_ctx_z       = jnp.concatenate([ref_ctx_z, z_t], axis=1)
-        ref_ctx_actions = jnp.concatenate([ref_ctx_actions, action_curr], axis=1)
+        # Fill T_ctx context frames.
+        _fill_context(ref_model, actions_ctx, z_ctx, e, sig_clean)
 
-    # ── Compare ─────────────────────────────────────────────────────────
+        # Fill future frames 0 .. t-1.
+        prev_act_ref = actions_ctx[:, -1:]
+        for t2 in range(t):
+            ref_model(prev_act_ref, step_idx_1, sig_idx_1, future_z[t2], deterministic=True)
+            ref_model.advance_cache()
+            prev_act_ref = future_actions[t2]
+
+        # Decode frame t.
+        pred_ref, _ = ref_model(prev_act_ref, step_idx_1, sig_idx_1, future_z[t],
+                                deterministic=True)
+        ref_preds.append(pred_ref)
+
+    # ── Compare ──────────────────────────────────────────────────────────────
     for t in range(H):
         diff = float(jnp.max(jnp.abs(inc_preds[t] - ref_preds[t])))
-        print(f"  frame {T_ctx+t}: max |extend_kv - ref|: {diff:.3e}")
-        assert diff < 1e-4, f"FAILED at frame {T_ctx+t}: diff={diff:.3e}"
+        print(f"  frame {T_ctx + t}: max |incremental - ref|: {diff:.3e}")
+        assert diff < 1e-4, f"FAILED at frame {T_ctx + t}: diff={diff:.3e}"
     print("  PASSED")
 
 
@@ -196,5 +198,5 @@ if __name__ == "__main__":
     print("=== KV cache correctness test ===")
     test_kv_cache_correctness()
     print()
-    print("=== extend_kv_cache correctness test ===")
+    print("=== extend_kv_cache (rolling cache) correctness test ===")
     test_extend_kv_cache_correctness()

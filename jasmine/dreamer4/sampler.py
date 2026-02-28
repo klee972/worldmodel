@@ -1,15 +1,30 @@
-# sampling logic for debugging / visualization. Not JIT friendly.
 from __future__ import annotations
 from dataclasses import dataclass
+from functools import partial
 from typing import Literal, Tuple, Optional, Dict, Any, Callable
 from einops import reduce
 
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jasmine.models.dreamer4_models import TokenizerDreamer4, DynamicsDreamer4, TaskEmbedder, PolicyHeadMTP
+from jasmine.models.dreamer4_models import TokenizerDreamer4, DynamicsDreamer4, TaskEmbedder
 from jasmine.utils.dreamer4_utils import pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck
+
+
+@partial(nnx.jit, static_argnames=('deterministic',))
+def _jit_call_dynamics(
+    dynamics: DynamicsDreamer4,
+    actions, step_idxs, signal_idxs, packed_enc_tokens,
+    agent_tokens=None,
+    deterministic: bool = True,
+):
+    """JIT-compiled wrapper for DynamicsDreamer4.__call__.
+    Compiles one forward pass into a single XLA program for efficient dispatch.
+    """
+    return dynamics(actions, step_idxs, signal_idxs, packed_enc_tokens,
+                    agent_tokens=agent_tokens, deterministic=deterministic)
 
 # ---------------------------
 # Config & small utilities
@@ -179,36 +194,41 @@ def _emit_plan(plan: dict, hook: Optional[Callable[[dict], None]], enable_print:
 def denoise_single_latent(
     *,
     dynamics: DynamicsDreamer4,
-    actions_ctx: jnp.ndarray,     # (B, T_ctx)
-    action_curr: jnp.ndarray,     # (B, 1)
+    actions_ctx: jnp.ndarray,     # (B, T_ctx) — original (unshifted) context actions
     z_ctx_clean: jnp.ndarray,     # (B, T_ctx, n_spatial, D_s) clean context
     z_t_init: jnp.ndarray,        # (B, 1, n_spatial, D_s) initial latent at tau0
     k_max: int,
-    d: float, # step size (1/4 if denoise 4 times per sample)
+    d: float,
     start_mode: StartMode,
     tau0_fixed: float,
     rng_key: jax.Array,
-    clean_target_next: Optional[jnp.ndarray] = None,  # (B,1,n_spatial,D_s) if TF else None
-    agent_tokens: jnp.ndarray = None, # (B, T_ctx + 1, n_agent, d_model)
+    clean_target_next: Optional[jnp.ndarray] = None,
+    agent_tokens: jnp.ndarray = None,
     match_ctx_tau: bool = False,
-    kv_cache=None,  # pre-computed context KV cache; if provided, skips encode_context
-    ctx_noise_tau: Optional[float] = None,  # τ of context noise; None/1.0=clean, 0.9=10% noise
+    ctx_noise_tau: Optional[float] = None,
 ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
-    """
-    Denoise a single future latent using a τ-ladder.
-      - Uses adaptive mixing α = (τ_{s+1} − τ_s) / (1 − τ_s)
-      - If match_ctx_tau=True, corrupt context to current τ at each step using a fixed z0_ctx
-      - Returns both the denoised latent and the hidden state h_t from the final step
-    
-    Returns:
-        z_t: (B, 1, n_spatial, D_s) denoised latent
-        h_t: (B, 1, n_agent, d_model) or None - hidden state from final dynamics call
+    """Denoise a single future latent using a τ-ladder.
+
+    actions_ctx holds the original (unshifted) context actions:
+    actions_ctx[:, t] = a_t (action executed AT frame t, leading to frame t+1).
+    The action for the future frame is actions_ctx[:, -1] = a_{T_ctx-1}.
+
+    When dynamics.decode=True (inference model with KV cache):
+      - The cache must already be filled with context frames by the caller
+        (via dynamics.init_cache() + frame-by-frame forward passes with
+        advance_cache() after each frame).
+      - All tau steps write to the same cache slot (no auto-increment).
+        After the tau ladder completes, advance_cache() is called once to
+        finalise the slot and move to the next position.
+
+    When dynamics.decode=False (training model):
+      - Full-sequence forward pass each step.
+      - match_ctx_tau=False: context is kept clean (z0_ctx unused).
+      - match_ctx_tau=True:  context is corrupted to current tau each step.
     """
     B, T_ctx, n_spatial, D_s = z_ctx_clean.shape
     _assert_power_of_two(k_max)
-    # Accept both flat (B, T) and hierarchical (B, T, 2) action shapes
     assert actions_ctx.shape[:2] == (B, T_ctx), f"Expected actions_ctx leading dims ({B}, {T_ctx}), got {actions_ctx.shape}"
-    assert action_curr.shape[:2] == (B, 1), f"Expected action_curr leading dims ({B}, 1), got {action_curr.shape}"
 
     # 1) choose tau0
     rng_key, r_tau, r_noise, r_ctx = jax.random.split(rng_key, 4)
@@ -220,81 +240,67 @@ def denoise_single_latent(
         tau0 = float(jax.random.uniform(r_tau, (), minval=0.0, maxval=1.0))
     tau0_aligned = _align_to_grid(tau0, d) if tau0 > 0.0 else 0.0
 
-    # Base noise for context if we match τ per step
     z0_ctx = jax.random.normal(r_ctx, z_ctx_clean.shape, dtype=z_ctx_clean.dtype) if match_ctx_tau else None
 
-    # 2) init current latent at tau0 (caller already provided it)
+    # 2) init latent
     z_t = z_t_init
 
-    # 3) tau ladder & indices  (FIX: pass d as d_opt, and tau0_aligned as start_tau)
+    # 3) tau ladder
     schedule = "shortcut" if d > (1.0 / k_max) else "finest"
     tau_seq, S, d_used, e = _tau_grid_from(k_max, schedule, d, tau0_aligned)
-    tau_seq_host = list(np.asarray(tau_seq))  # host loop
+    tau_seq_host = list(np.asarray(tau_seq))
 
-    # Initialize h_t_final to None (will be set on final iteration)
     h_t_final = None
 
-    # Pre-compute context KV cache when context tokens are fixed (match_ctx_tau=False)
-    if not match_ctx_tau:
-        if kv_cache is None:
-            # No external cache provided — compute from context from scratch
-            z_ctx_encode = z_ctx_clean
-            ctx_sig_val = k_max - 1
-            if ctx_noise_tau is not None and float(ctx_noise_tau) < 1.0:
-                _tau = float(ctx_noise_tau)
-                _noise = jax.random.normal(r_ctx, z_ctx_clean.shape, dtype=z_ctx_clean.dtype)
-                z_ctx_encode = _tau * z_ctx_clean + (1.0 - _tau) * _noise
-                ctx_sig_val = int(np.clip(int(_tau * k_max), 0, k_max - 1))
-            step_idx_ctx = jnp.full((B, T_ctx), e, dtype=jnp.int32)
-            signal_idx_ctx = jnp.full((B, T_ctx), ctx_sig_val, dtype=jnp.int32)
-            kv_cache = dynamics.encode_context(
-                actions_ctx, step_idx_ctx, signal_idx_ctx, z_ctx_encode,
-                agent_tokens_ctx=(agent_tokens[:, :T_ctx] if agent_tokens is not None else None),
-            )
-        # else: use the caller-provided kv_cache as-is
+    use_cache = dynamics.decode and not match_ctx_tau
 
-    # 4) iterate S steps
+    # 4) tau ladder steps
     for s in range(1, len(tau_seq_host)):
         tau_prev = float(tau_seq_host[s - 1])
         tau_curr = float(tau_seq_host[s])
-        # per-step mixing ratio toward clean:
         alpha = (tau_curr - tau_prev) / max(1.0 - tau_prev, 1e-8)
 
         signal_idx_future = jnp.full((B, 1), _signal_idx_from_tau(jnp.asarray(tau_prev), k_max), dtype=jnp.int32)
 
-        if kv_cache is not None:
-            # Decode mode: only process the future token, reusing cached context K/V.
-            # Pass [a_{T_ctx-1}, a_curr] (shape B×2) so that after shift-by-one encoding,
-            # position 1 = emb(a_{T_ctx-1}), which dynamics.__call__ slices to get action_tokens.
+        if use_cache:
+            # All tau steps write to the same cache slot (no auto-increment in forward).
+            # The future frame's action token = a_{T_ctx-1} = actions_ctx[:, -1].
             step_idx_fut = jnp.full((B, 1), e, dtype=jnp.int32)
-            actions_for_decode = jnp.concatenate([actions_ctx[:, -1:], action_curr], axis=1)
             agent_fut = agent_tokens[:, T_ctx:T_ctx+1] if agent_tokens is not None else None
-            z_clean_pred, h_seq = dynamics(
-                actions_for_decode, step_idx_fut, signal_idx_future, z_t,
-                agent_tokens=agent_fut, deterministic=True, kv_cache=kv_cache,
+            z_clean_pred, h_seq = _jit_call_dynamics(
+                dynamics, actions_ctx[:, -1:], step_idx_fut, signal_idx_future, z_t,
+                agent_tokens=agent_fut,
             )
         else:
-            # Original path (match_ctx_tau=True): corrupt context to current τ each step
-            z_ctx_tau = tau_curr * z_ctx_clean + (1.0 - tau_curr) * z0_ctx
-            z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)                   # (B, T_ctx+1, n_spatial, D_s)
-            actions_full = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
+            # Full-sequence path (match_ctx_tau=True or training model).
+            # Shift here: prepend sentinel -1 so frame 0 gets base_action_emb,
+            # frame t gets a_{t-1}, and future frame T_ctx gets a_{T_ctx-1}.
+            # When match_ctx_tau=False the context stays clean (z0_ctx is None).
+            z_ctx_tau = (tau_curr * z_ctx_clean + (1.0 - tau_curr) * z0_ctx
+                         if z0_ctx is not None else z_ctx_clean)
+            z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)
+            sentinel = jnp.full((B, 1), -1, dtype=actions_ctx.dtype)
+            actions_full = jnp.concatenate([sentinel, actions_ctx], axis=1)  # (B, T_ctx+1)
             step_idx = jnp.full((B, T_ctx + 1), e, dtype=jnp.int32)
             signal_idx_ctx = jnp.full((B, T_ctx), _signal_idx_from_tau(jnp.asarray(tau_curr), k_max), dtype=jnp.int32)
             signal_idx = jnp.concatenate([signal_idx_ctx, signal_idx_future], axis=1)
-            z_clean_pred_seq, h_seq = dynamics(
-                actions_full, step_idx, signal_idx, z_seq,
-                agent_tokens=agent_tokens, deterministic=True,
+            z_clean_pred_seq, h_seq = _jit_call_dynamics(
+                dynamics, actions_full, step_idx, signal_idx, z_seq,
+                agent_tokens=agent_tokens,
             )
             z_clean_pred = z_clean_pred_seq[:, -1:, :, :]
 
-        # Store hidden state from final step (tau=1.0)
         if s == len(tau_seq_host) - 1 and h_seq is not None:
-            h_t_final = h_seq[:, -1:, :, :]  # (B, 1, n_agent, d_model)
+            h_t_final = h_seq[:, -1:, :, :]
 
-        # Update with α
         z_t = (1.0 - alpha) * z_t + alpha * z_clean_pred
 
-    return z_t, h_t_final  # (B,1,n_spatial,D_s), (B,1,n_agent,d_model) or None
+    if use_cache:
+        # Tau ladder complete: frame is finalised in the current slot.
+        # Advance the cache index so the next frame writes to the next slot.
+        dynamics.advance_cache()
+
+    return z_t, h_t_final
 
 # ---------------------------
 # Multi-frame rollout wrapper
@@ -352,10 +358,8 @@ def sample_video(
     preds: list[jnp.ndarray] = []
     n_spatial, D_s = int(z_all.shape[2]), int(z_all.shape[3])
 
-    # Pre-compute initial context KV cache once (only when match_ctx_tau=False)
-    # This cache grows by 1 frame per horizon step, avoiding re-encoding the full context.
-    rollout_kv_cache = None
-    if not config.match_ctx_tau:
+    # Pre-fill inference cache with context frames (only when dynamics.decode=True)
+    if dynamics.decode and not config.match_ctx_tau:
         z_ctx_for_encode = z_ctx_clean
         ctx_sig_val = config.dyna_k_max - 1
         if config.ctx_noise_tau is not None and float(config.ctx_noise_tau) < 1.0:
@@ -364,15 +368,25 @@ def sample_video(
             _noise = jax.random.normal(ctx_noise_key, z_ctx_clean.shape, dtype=z_ctx_clean.dtype)
             z_ctx_for_encode = _tau * z_ctx_clean + (1.0 - _tau) * _noise
             ctx_sig_val = int(np.clip(int(_tau * config.dyna_k_max), 0, config.dyna_k_max - 1))
-        step_idx_ctx = jnp.full((B, config.ctx_length), e, dtype=jnp.int32)
-        sig_idx_ctx  = jnp.full((B, config.ctx_length), ctx_sig_val, dtype=jnp.int32)
-        rollout_kv_cache = dynamics.encode_context(actions_ctx, step_idx_ctx, sig_idx_ctx, z_ctx_for_encode)
+
+        # Allocate cache: context + full horizon
+        dynamics.init_cache(B, config.ctx_length + horizon)
+        step_idx_1 = jnp.full((B, 1), e, dtype=jnp.int32)
+        sig_idx_1  = jnp.full((B, 1), ctx_sig_val, dtype=jnp.int32)
+
+        # Encode context frame-by-frame.
+        # Shift: frame t gets a_{t-1}; frame 0 gets sentinel -1.
+        sentinel = jnp.full((B, 1), -1, dtype=actions_ctx.dtype)
+        shifted_ctx = jnp.concatenate([sentinel, actions_ctx[:, :-1]], axis=1)  # (B, T_ctx)
+        for t_ctx in range(config.ctx_length):
+            _jit_call_dynamics(dynamics, shifted_ctx[:, t_ctx:t_ctx+1], step_idx_1, sig_idx_1,
+                               z_ctx_for_encode[:, t_ctx:t_ctx+1])
+            dynamics.advance_cache()
 
     for t in range(horizon):
         action_curr = future_actions[:, t:t+1]
         z1_ref = gt_future_latents[:, t:t+1, :, :] if config.rollout == "teacher_forced" else None
 
-        # Initial latent at tau0 (pure start → tau0=0)
         rng, z0key = jax.random.split(rng)
         z0 = jax.random.normal(z0key, (B, 1, n_spatial, D_s), dtype=z_all.dtype)
         z_t_init = z0
@@ -381,7 +395,6 @@ def sample_video(
         z_clean_pred, _ = denoise_single_latent(
             dynamics=dynamics,
             actions_ctx=actions_ctx,
-            action_curr=action_curr,
             z_ctx_clean=z_ctx_clean,
             z_t_init=z_t_init,
             k_max=config.dyna_k_max,
@@ -391,30 +404,19 @@ def sample_video(
             rng_key=step_key,
             clean_target_next=z1_ref,
             match_ctx_tau=config.match_ctx_tau,
-            kv_cache=rollout_kv_cache,  # pass growing cache; None if match_ctx_tau=True
             ctx_noise_tau=config.ctx_noise_tau,
         )
         preds.append(z_clean_pred)
 
-        # Extend KV cache with the newly denoised (or GT) frame
-        if rollout_kv_cache is not None:
-            z_to_cache = z_clean_pred if config.rollout == "autoregressive" else z1_ref
-            actions_for_extend = jnp.concatenate([actions_ctx[:, -1:], action_curr], axis=1)
-            rollout_kv_cache = dynamics.extend_kv_cache(
-                actions_for_extend,
-                jnp.full((B, 1), e, dtype=jnp.int32),
-                jnp.full((B, 1), config.dyna_k_max - 1, dtype=jnp.int32),  # clean: τ=1.0
-                z_to_cache,
-                rollout_kv_cache,
-            )
+        # When using the internal KV cache: after the tau ladder, the last decode step has
+        # written the future frame's K/V to the cache slot at t_ctx+t.  The cache_index now
+        # points to t_ctx+t+1, ready for the next horizon frame — no separate "extend" needed.
+        # When not using the cache (match_ctx_tau), the context array is advanced below.
 
-        # advance context (AR: use our prediction; TF: use GT)
-        if config.rollout == "autoregressive":
-            z_ctx_clean = jnp.concatenate([z_ctx_clean, z_clean_pred], axis=1)[:, -config.ctx_length:, :, :]
-            actions_ctx = jnp.concatenate([actions_ctx, action_curr], axis=1)[:, -config.ctx_length:]
-        else:
-            z_ctx_clean = jnp.concatenate([z_ctx_clean, z1_ref], axis=1)[:, -config.ctx_length:, :, :]
-            actions_ctx = jnp.concatenate([actions_ctx, action_curr], axis=1)[:, -config.ctx_length:]
+        # Advance context arrays (used by the full-sequence path and for bookkeeping)
+        z_to_add = z_clean_pred if config.rollout == "autoregressive" else z1_ref
+        z_ctx_clean = jnp.concatenate([z_ctx_clean, z_to_add], axis=1)[:, -config.ctx_length:, :, :]
+        actions_ctx = jnp.concatenate([actions_ctx, action_curr], axis=1)[:, -config.ctx_length:]
 
     # 6) decode predictions (prepend context for viz)
     pred_latents = jnp.concatenate(preds, axis=1)
