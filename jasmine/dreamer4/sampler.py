@@ -279,8 +279,8 @@ def denoise_single_latent(
             z_ctx_tau = (tau_curr * z_ctx_clean + (1.0 - tau_curr) * z0_ctx
                          if z0_ctx is not None else z_ctx_clean)
             z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)
-            sentinel = jnp.full((B, 1), -1, dtype=actions_ctx.dtype)
-            actions_full = jnp.concatenate([sentinel, actions_ctx], axis=1)  # (B, T_ctx+1)
+            sentinel = jnp.full((B, 1) + actions_ctx.shape[2:], -1, dtype=actions_ctx.dtype)
+            actions_full = jnp.concatenate([sentinel, actions_ctx], axis=1)  # (B, T_ctx+1[, ...])
             step_idx = jnp.full((B, T_ctx + 1), e, dtype=jnp.int32)
             signal_idx_ctx = jnp.full((B, T_ctx), _signal_idx_from_tau(jnp.asarray(tau_curr), k_max), dtype=jnp.int32)
             signal_idx = jnp.concatenate([signal_idx_ctx, signal_idx_future], axis=1)
@@ -376,7 +376,7 @@ def sample_video(
 
         # Encode context frame-by-frame.
         # Shift: frame t gets a_{t-1}; frame 0 gets sentinel -1.
-        sentinel = jnp.full((B, 1), -1, dtype=actions_ctx.dtype)
+        sentinel = jnp.full((B, 1) + actions_ctx.shape[2:], -1, dtype=actions_ctx.dtype)
         shifted_ctx = jnp.concatenate([sentinel, actions_ctx[:, :-1]], axis=1)  # (B, T_ctx)
         for t_ctx in range(config.ctx_length):
             _jit_call_dynamics(dynamics, shifted_ctx[:, t_ctx:t_ctx+1], step_idx_1, sig_idx_1,

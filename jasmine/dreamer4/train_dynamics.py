@@ -92,13 +92,13 @@ class Args:
     tokenizer_checkpoint: str = "/home/4bkang/rl/jasmine/ckpts/minecraft/dreamer4/tokenizer"
     # Dynamics
     dyna_d_model: int = 1536
-    dyna_packing_factor: int = 2
-    dyna_d_spatial: int = 128  # must equal dyna_packing_factor * d_latent
-    dyna_n_spatial: int = 16  # should be dyna_n_spatial * dyna_packing_factor = n_latent
+    dyna_packing_factor: int = 1
+    dyna_d_spatial: int = 64  # must equal dyna_packing_factor * d_latent
+    dyna_n_spatial: int = 32  # should be dyna_n_spatial * dyna_packing_factor = n_latent
     dyna_n_register: int = 4
     dyna_n_agent: int = 1
     dyna_n_block: int = 20
-    dyna_n_head: int = 16
+    dyna_n_head: int = 24
     dyna_k_max: int = 64
     batch_size_self: int = batch_size // 2
     seq_len_short: int = 16       # short branch T; ignored when seq_len_ratio == 0.0
@@ -379,14 +379,9 @@ def restore_or_initialize_components(
             val_iterator = restored["val_dataloader_state"]
         step = restore_step or 0
         print(f"Restored dataloader and model state from step {step}")
-        # Note: tokenizer weights are assumed to be saved/restored with the full checkpoint
-        # If tokenizer needs separate restoration, add logic here
-    else:
-        # Restore pre-trained tokenizer from checkpoint
-        rng, _rng = jax.random.split(rng)
-        tokenizer = restore_dreamer4_tokenizer(
-            replicated_sharding, _rng, args
-        )
+    # Tokenizer is always frozen (not trained), so always restore from its pretrained checkpoint.
+    rng, _rng = jax.random.split(rng)
+    tokenizer = restore_dreamer4_tokenizer(replicated_sharding, _rng, args)
     return step, optimizer, tokenizer, train_iterator, val_iterator, rng
 
 

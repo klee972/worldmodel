@@ -36,6 +36,7 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify
 
 
 
+
 @dataclass
 class Args:
     # Experiment
@@ -47,7 +48,7 @@ class Args:
     image_width: int = 200
     save_ckpt: bool = True
     restore_ckpt: bool = False
-    restore_step: int = 120_000
+    restore_step: int = 5000
     # CALVIN data
     train_data_dirs: list[str] = field(default_factory=lambda: [
         "/home/4bkang/rl/calvin/dataset/task_ABCD_D/training/",

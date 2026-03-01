@@ -1610,6 +1610,84 @@ class CameraHierarchicalActionMapping:
         return self._factored_to_raw_single(factored["buttons"][0], factored["camera"][0])
 
 
+class CALVINActionMapping:
+    """
+    Maps CALVIN 7D continuous actions to per-dimension discrete bin indices.
+
+    CALVIN rel_actions format (7D):
+      [0:3] delta position (x, y, z)     — continuous, range ≈ [-1, 1]
+      [3:6] delta orientation (a, b, c)  — continuous, range ≈ [-1, 1]
+      [6]   gripper open/close           — binary: -1 (close) or +1 (open)
+
+    Output indices (7D int32):
+      [0:6] arm dims → [0, n_arm_bins - 1] via uniform or mu-law binning
+      [6]   gripper  → 0 (close) or 1 (open)
+
+    When use_mu_law=True, foveated (mu-law) quantization is applied to the 6
+    arm dimensions before binning.  Small movements near zero get finer
+    resolution; large movements are coarser.  This mirrors CameraQuantizer.
+    """
+
+    def __init__(
+        self,
+        n_arm_bins: int = 11,
+        arm_clip: float = 1.0,
+        use_mu_law: bool = False,
+        mu: float = 5.0,
+    ):
+        self.n_arm_bins = n_arm_bins
+        self.arm_clip = arm_clip
+        self.use_mu_law = use_mu_law
+        self.mu = mu
+        self.n_gripper_bins = 2
+
+    @property
+    def n_bins_per_dim(self) -> list:
+        return [self.n_arm_bins] * 6 + [self.n_gripper_bins]
+
+    def _discretize_arm(self, x: np.ndarray) -> np.ndarray:
+        """Clip, optionally apply mu-law compression, then uniformly bin to [0, n_arm_bins - 1]."""
+        x = np.clip(x, -self.arm_clip, self.arm_clip)
+        if self.use_mu_law:
+            # Normalize to [-1, 1], compress with mu-law, then scale back.
+            # Mirrors CameraQuantizer.discretize() exactly.
+            x = x / self.arm_clip
+            x = np.sign(x) * (np.log(1.0 + self.mu * np.abs(x)) / np.log(1.0 + self.mu))
+            x = x * self.arm_clip
+        # Map [-arm_clip, arm_clip] → [0, n_arm_bins - 1]
+        normalized = (x + self.arm_clip) / (2.0 * self.arm_clip)  # [0, 1]
+        bins = np.floor(normalized * self.n_arm_bins).astype(np.int32)
+        return np.clip(bins, 0, self.n_arm_bins - 1)
+
+    def _discretize_gripper(self, x: np.ndarray) -> np.ndarray:
+        """Binary: < 0 → 0 (close), >= 0 → 1 (open)."""
+        return (x >= 0).astype(np.int32)
+
+    def continuous_to_indices(self, rel_actions: np.ndarray) -> np.ndarray:
+        """
+        Args:
+            rel_actions: (..., 7) float — rel_actions from CALVIN NPZ
+        Returns:
+            indices: (..., 7) int32
+        """
+        arm = self._discretize_arm(rel_actions[..., :6])       # (..., 6)
+        gripper = self._discretize_gripper(rel_actions[..., 6:7])  # (..., 1)
+        return np.concatenate([arm, gripper], axis=-1).astype(np.int32)
+
+    def stack_with_sentinel(self, indices: np.ndarray) -> np.ndarray:
+        """
+        Prepend a sentinel row of -1 so that the first frame has no previous action.
+
+        Args:
+            indices: (B, T-1, 7) int32 — discretized actions for frames 1..T-1
+        Returns:
+            (B, T, 7) int32 — sentinel prepended; frame 0 = -1, frame t = action_{t-1}
+        """
+        B = indices.shape[0]
+        sentinel = np.full((B, 1, 7), -1, dtype=np.int32)
+        return np.concatenate([sentinel, indices], axis=1)
+
+
 class ActionEncoder(nnx.Module):
     def __init__(
         self,
@@ -1706,6 +1784,83 @@ class HierarchicalActionEncoder(nnx.Module):
         return out
 
 
+class CALVINActionEncoder(nnx.Module):
+    """
+    Action encoder for CALVIN 7D continuous actions (discretized per-dimension).
+
+    Expects actions of shape (B, T, 7) where the 7 dimensions are:
+      [0:6] arm dims (delta pos x/y/z, delta ori a/b/c) — each in [0, n_arm_bins - 1]
+      [6]   gripper — 0 (close) or 1 (open)
+
+    Each dimension has its own embedding table; all 7 embeddings are summed together
+    with a shared base embedding, matching the interface of ActionEncoder and
+    HierarchicalActionEncoder so that DynamicsDreamer4 can swap between them.
+
+    Use CALVINActionMapping to convert continuous rel_actions → int32 indices before
+    passing to this encoder.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_arm_bins: int,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.n_arm_bins = n_arm_bins
+        self.base_action_emb = nnx.Param(
+            nnx.initializers.normal(0.02)(rngs.params(), (d_model,))
+        )
+        # 6 separate embedding tables for arm dimensions (pos x/y/z, ori a/b/c)
+        self.emb_arm_0 = nnx.Embed(n_arm_bins, d_model, param_dtype=param_dtype, dtype=dtype, rngs=rngs)
+        self.emb_arm_1 = nnx.Embed(n_arm_bins, d_model, param_dtype=param_dtype, dtype=dtype, rngs=rngs)
+        self.emb_arm_2 = nnx.Embed(n_arm_bins, d_model, param_dtype=param_dtype, dtype=dtype, rngs=rngs)
+        self.emb_arm_3 = nnx.Embed(n_arm_bins, d_model, param_dtype=param_dtype, dtype=dtype, rngs=rngs)
+        self.emb_arm_4 = nnx.Embed(n_arm_bins, d_model, param_dtype=param_dtype, dtype=dtype, rngs=rngs)
+        self.emb_arm_5 = nnx.Embed(n_arm_bins, d_model, param_dtype=param_dtype, dtype=dtype, rngs=rngs)
+        # 1 embedding table for gripper (2 bins: 0=close, 1=open)
+        self.emb_gripper = nnx.Embed(2, d_model, param_dtype=param_dtype, dtype=dtype, rngs=rngs)
+
+    def __call__(
+        self,
+        actions: Optional[jnp.ndarray] = None,  # (B, T, 7) int32; -1 = sentinel
+        batch_time_shape: Optional[Tuple[int, int]] = None,
+        as_tokens: bool = True,
+    ):
+        if actions is None:
+            assert batch_time_shape is not None
+            B, T = batch_time_shape
+            out = jnp.broadcast_to(self.base_action_emb.value, (B, T, self.d_model))
+        else:
+            sentinel = actions[..., 0] < 0  # (B, T): True where row is the -1 sentinel
+
+            # Clamp indices to valid range before embedding
+            arm_idxs = jnp.maximum(actions[..., :6], 0)   # (B, T, 6)
+            grip_idx  = jnp.maximum(actions[..., 6], 0)   # (B, T)
+
+            embs = [
+                self.emb_arm_0(arm_idxs[..., 0]),
+                self.emb_arm_1(arm_idxs[..., 1]),
+                self.emb_arm_2(arm_idxs[..., 2]),
+                self.emb_arm_3(arm_idxs[..., 3]),
+                self.emb_arm_4(arm_idxs[..., 4]),
+                self.emb_arm_5(arm_idxs[..., 5]),
+                self.emb_gripper(grip_idx),
+            ]  # each (B, T, d_model)
+
+            # Zero out all embeddings at sentinel positions
+            embs = [jnp.where(sentinel[..., None], jnp.zeros_like(e), e) for e in embs]
+
+            # Sum all per-dim embeddings + base
+            out = sum(embs) + self.base_action_emb.value
+
+        if as_tokens:
+            out = out[:, :, None, :]
+        return out
+
+
 class DynamicsDreamer4(nnx.Module):
     def __init__(
         self,
@@ -1728,6 +1883,7 @@ class DynamicsDreamer4(nnx.Module):
         use_flash_attention: bool = True,
         pos_emb_type: str = "sinusoidal",  # "sinusoidal", "rope", or "none"
         n_camera: Optional[int] = None,    # If set, use HierarchicalActionEncoder (Minecraft)
+        n_arm_bins: Optional[int] = None,  # If set, use CALVINActionEncoder (CALVIN 7D)
         decode: bool = False,              # True for inference model with KV cache
     ):
         """
@@ -1759,6 +1915,11 @@ class DynamicsDreamer4(nnx.Module):
         if n_camera is not None:
             self.action_encoder = HierarchicalActionEncoder(
                 d_model=d_model, n_buttons=n_actions, n_camera=n_camera,
+                dtype=dtype, param_dtype=param_dtype, rngs=rngs,
+            )
+        elif n_arm_bins is not None:
+            self.action_encoder = CALVINActionEncoder(
+                d_model=d_model, n_arm_bins=n_arm_bins,
                 dtype=dtype, param_dtype=param_dtype, rngs=rngs,
             )
         else:
@@ -2004,7 +2165,7 @@ def restore_dreamer4_tokenizer(
         mlp_ratio=args.mlp_ratio,
         latent_dim=args.d_latent,
         num_latent_tokens=args.n_latent,
-        time_every=args.time_every,
+        time_every=args.tokenizer_time_every,
         patch_size=args.patch_size,
         num_blocks=args.tokenizer_n_block,
         num_heads=args.tokenizer_n_head,
