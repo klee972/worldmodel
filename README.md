@@ -31,19 +31,18 @@ uv sync
 ```
 jasmine/
 ├── jasmine/
-│   ├── dreamer4/          # Dreamer4 training scripts
+│   ├── dreamer4/                 # Dreamer4 training scripts
 │   │   ├── train_tokenizer.py
 │   │   ├── train_dynamics.py
 │   │   └── ...
-│   ├── models/            # Model definitions
-│   ├── baselines/         # Baseline model comparisons
-│   └── utils/             # Utilities
+│   ├── models/                   # Model definitions
+│   └── utils/                    # Utilities
 ├── data/
 │   └── jasmine_data/
 │       └── minecraft/
-│           └── openai/    # Data download scripts
-├── run_tok.sh             # Tokenizer training entrypoint
-└── run_dyna.sh            # Dynamics model training entrypoint
+│           └── openai/           # Data download scripts
+├── run_tok_{dataset_name}.sh     # Tokenizer training entrypoint
+└── run_dyna_{dataset_name}.sh    # Dynamics model training entrypoint
 ```
 
 ## Data Pipeline
