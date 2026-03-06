@@ -2131,44 +2131,6 @@ class DynamicsDreamer4(nnx.Module):
                 block.temporal_attention.cache_index.value = t_arr
 
 
-class TaskEmbedder(nnx.Module):
-    def __init__(
-        self, d_model: int, 
-        dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nnx.Rngs,
-        n_agent: int = 1, use_ids: bool = True, n_tasks: int = 128, d_task: int = 64,
-    ):
-        self.d_model = d_model
-        self.n_agent = n_agent
-        self.use_ids = use_ids # True: task is int ids; False: task is vector
-        self.n_tasks = n_tasks # only used if use_ids=True
-        self.d_task = d_task   # only used if use_ids=False
-
-        if self.use_ids:
-            self.task_table = nnx.Embed(n_tasks, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        else:
-            self.task_proj = nnx.Linear(d_task, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.base_agent_emb = nnx.Param(nnx.initializers.normal(0.02)(rngs.params(), (d_model,)))
-
-    def __call__(self, task, B: int, T: int):
-        """
-        If use_ids=True:
-            task: (B,) int32 ids in [0, n_tasks)
-        Else:
-            task: (B, d_task) float32 vector
-
-        Returns agent tokens: (B, T, n_agent, d_model)
-        """
-        if self.use_ids:
-            emb = self.task_table(task)  # (B, D)
-        else:
-            emb = self.task_proj(task)   # (B, D)
-
-        # Learned base + optional small MLP to decouple from raw table
-        x = emb + self.base_agent_emb[None, :]
-
-        # Replicate across time and agent slots
-        x = jnp.broadcast_to(x[:, None, None, :], (B, T, self.n_agent, self.d_model))
-        return x
 
 
 def restore_dreamer4_tokenizer(
