@@ -1,6 +1,6 @@
 # Dreamer4-NNX
 
-A JAX + flax NNX-based implementation of the Dreamer4 world model. Trains a tokenizer and dynamics model using the OpenAI Video-Pre-Training (VPT) Minecraft dataset.
+A JAX + flax NNX-based implementation of the Dreamer4 world model. Trains a tokenizer and dynamics model using coinrun, VPT(minecraft), and CALVIN dataset.
 
 ## References
 
@@ -46,6 +46,8 @@ jasmine/
 ```
 
 ## Data Pipeline
+
+Following is the instruction for Minecraft data preparation. For CALVIN, please refer to their repo(https://github.com/mees/calvin).
 
 Prepare the Minecraft dataset by running the following steps in order.
 
