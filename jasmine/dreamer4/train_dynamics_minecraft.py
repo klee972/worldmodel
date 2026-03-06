@@ -56,7 +56,7 @@ class Args:
     image_channels: int = 3
     image_height: int = 224
     image_width: int = 384
-    data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/train"
+    data_dir: str = "data/minecraft_chunk64_224p_split/train"
     save_ckpt: bool = True
     restore_ckpt: bool = False
     # Optimization
@@ -91,7 +91,7 @@ class Args:
     tokenizer_n_block: int = 12
     tokenizer_n_head: int = 12
     tokenizer_time_every: int = 4
-    tokenizer_checkpoint: str = "/home/4bkang/rl/jasmine/ckpts/minecraft/dreamer4/tokenizer"
+    tokenizer_checkpoint: str = "ckpts/minecraft/dreamer4/tokenizer"
     # Dynamics
     dyna_d_model: int = 1536
     dyna_packing_factor: int = 1
@@ -114,11 +114,11 @@ class Args:
     tags: list[str] = field(default_factory=lambda: ["dynamics", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/minecraft/dreamer4/dynamics"
+    ckpt_dir: str = "ckpts/minecraft/dreamer4/dynamics"
     log_checkpoint_interval: int = 5000
     log_checkpoint_keep_period: int = 10_000
     log_gradients: bool = False
-    val_data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/val"
+    val_data_dir: str = "data/minecraft_chunk64_224p_split/val"
     val_interval: int = 10_000
     val_steps: int = 5
     wandb_id: str = ""

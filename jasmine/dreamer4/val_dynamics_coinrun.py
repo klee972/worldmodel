@@ -58,7 +58,7 @@ class Args:
     tokenizer_n_block: int = 4
     tokenizer_n_head: int = 8
     tokenizer_time_every: int = 4
-    tokenizer_checkpoint: str = "/home/4bkang/rl/jasmine/ckpts/coinrun/dreamer4/tokenizer"
+    tokenizer_checkpoint: str = "ckpts/coinrun/dreamer4/tokenizer"
     # Dynamics
     dyna_d_model: int = 768
     dyna_packing_factor: int = 2
@@ -72,10 +72,10 @@ class Args:
     ctx_length: int = 8
     ctx_noise_tau: float = 0.9
     # Checkpoint
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/coinrun/dreamer4/dynamics_ctx1"
+    ckpt_dir: str = "ckpts/coinrun/dreamer4/dynamics_ctx1"
     restore_step: int = 40000  # 0 = latest
     # Validation data
-    val_data_dir: str = "/home/4bkang/rl/jasmine/data/coinrun_episodes/val"
+    val_data_dir: str = "data/coinrun_episodes/val"
     val_steps: int = 10
     # Logging
     log: bool = True

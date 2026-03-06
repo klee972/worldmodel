@@ -91,7 +91,7 @@ class Args:
     tags: list[str] = field(default_factory=lambda: ["tokenizer", "dreamer4", "calvin"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/calvin/dreamer4/tokenizer_nl32"
+    ckpt_dir: str = "ckpts/calvin/dreamer4/tokenizer_nl32"
     log_checkpoint_interval: int = 1000
     log_checkpoint_keep_period: int = 20_000
     log_gradients: bool = False

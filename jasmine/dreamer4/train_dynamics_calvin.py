@@ -89,7 +89,7 @@ class Args:
     tokenizer_time_every: int = 3
     tokenizer_n_block: int = 6
     tokenizer_n_head: int = 8
-    tokenizer_checkpoint: str = "/home/4bkang/rl/jasmine/ckpts/calvin/dreamer4/tokenizer"
+    tokenizer_checkpoint: str = "ckpts/calvin/dreamer4/tokenizer"
     # Dynamics
     dyna_d_model: int = 1024
     dyna_packing_factor: int = 1
@@ -112,7 +112,7 @@ class Args:
     tags: list[str] = field(default_factory=lambda: ["dynamics", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/calvin/dreamer4/dynamics"
+    ckpt_dir: str = "ckpts/calvin/dreamer4/dynamics"
     log_checkpoint_interval: int = 5000
     log_checkpoint_keep_period: int = 10_000
     log_gradients: bool = False

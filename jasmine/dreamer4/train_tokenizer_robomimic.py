@@ -51,19 +51,19 @@ class Args:
     # Robomimic data
     hdf5_paths: list[str] = field(default_factory=lambda: [
         # lift (ph, mh, mg)
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/lift/ph/image_v15.hdf5",
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/lift/mh/image_v15.hdf5",
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/lift/mg/image_sparse_v15.hdf5",
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/lift/mg/image_dense_v15.hdf5",
+        "robomimic_repo/datasets/lift/ph/image_v15.hdf5",
+        "robomimic_repo/datasets/lift/mh/image_v15.hdf5",
+        "robomimic_repo/datasets/lift/mg/image_sparse_v15.hdf5",
+        "robomimic_repo/datasets/lift/mg/image_dense_v15.hdf5",
         # can (ph, mh, mg, paired)
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/can/ph/image_v15.hdf5",
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/can/mh/image_v15.hdf5",
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/can/mg/image_sparse_v15.hdf5",
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/can/mg/image_dense_v15.hdf5",
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/can/paired/image_v15.hdf5",
+        "robomimic_repo/datasets/can/ph/image_v15.hdf5",
+        "robomimic_repo/datasets/can/mh/image_v15.hdf5",
+        "robomimic_repo/datasets/can/mg/image_sparse_v15.hdf5",
+        "robomimic_repo/datasets/can/mg/image_dense_v15.hdf5",
+        "robomimic_repo/datasets/can/paired/image_v15.hdf5",
         # square (ph, mh)
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/square/ph/image_v15.hdf5",
-        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/square/mh/image_v15.hdf5",
+        "robomimic_repo/datasets/square/ph/image_v15.hdf5",
+        "robomimic_repo/datasets/square/mh/image_v15.hdf5",
     ])
     image_key: str = "agentview_image"
     filter_key: str = "train"
@@ -102,7 +102,7 @@ class Args:
     tags: list[str] = field(default_factory=lambda: ["tokenizer", "dreamer4", "robomimic"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/robomimic/dreamer4/tokenizer"
+    ckpt_dir: str = "ckpts/robomimic/dreamer4/tokenizer"
     log_checkpoint_interval: int = 1000
     log_checkpoint_keep_period: int = 20_000
     log_gradients: bool = False

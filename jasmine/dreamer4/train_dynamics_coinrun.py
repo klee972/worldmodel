@@ -58,7 +58,7 @@ class Args:
     image_channels: int = 3
     image_height: int = 64
     image_width: int = 64
-    data_dir: str = "/home/4bkang/rl/jasmine/data/coinrun_episodes/train"
+    data_dir: str = "data/coinrun_episodes/train"
     save_ckpt: bool = True
     restore_ckpt: bool = False
     restore_step: int = 0
@@ -92,7 +92,7 @@ class Args:
     tokenizer_n_block: int = 4
     tokenizer_n_head: int = 8
     tokenizer_time_every: int = 4
-    tokenizer_checkpoint: str = "/home/4bkang/rl/jasmine/ckpts/coinrun/dreamer4/tokenizer"
+    tokenizer_checkpoint: str = "ckpts/coinrun/dreamer4/tokenizer"
     # Dynamics
     dyna_d_model: int = 768
     dyna_packing_factor: int = 1
@@ -113,11 +113,11 @@ class Args:
     tags: list[str] = field(default_factory=lambda: ["dynamics", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/coinrun/dreamer4/dynamics_muon"
+    ckpt_dir: str = "ckpts/coinrun/dreamer4/dynamics_muon"
     log_checkpoint_interval: int = 5000
     log_checkpoint_keep_period: int = 10_000
     log_gradients: bool = False
-    val_data_dir: str = "/home/4bkang/rl/jasmine/data/coinrun_episodes/val"
+    val_data_dir: str = "data/coinrun_episodes/val"
     val_interval: int = 10000
     val_steps: int = 10
     wandb_id: str = ""

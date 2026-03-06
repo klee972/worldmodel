@@ -2295,7 +2295,7 @@ if __name__ == "__main__":
     )
 
     # JSONL 파일에서 액션 로드
-    with open("/home/4bkang/rl/jasmine/data/open_ai_minecraft_actions_files/6.0_ilge-60b420bb3851-20210505-230344.jsonl") as f:
+    with open("data/open_ai_minecraft_actions_files/6.0_ilge-60b420bb3851-20210505-230344.jsonl") as f:
         raw_actions = [json.loads(line) for line in f]
 
     # 학습 데이터로 변환

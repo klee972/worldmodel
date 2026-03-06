@@ -46,7 +46,7 @@ class Args:
     # image_width: int = 384
     image_height: int = 112
     image_width: int = 192
-    data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/train"
+    data_dir: str = "data/minecraft_chunk64_224p_split/train"
     save_ckpt: bool = True
     restore_ckpt: bool = False
     restore_step: int = 0
@@ -86,11 +86,11 @@ class Args:
     tags: list[str] = field(default_factory=lambda: ["tokenizer", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/minecraft_112p/dreamer4/tokenizer"
+    ckpt_dir: str = "ckpts/minecraft_112p/dreamer4/tokenizer"
     log_checkpoint_interval: int = 1000
     log_checkpoint_keep_period: int = 10_000
     log_gradients: bool = False
-    val_data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/val"
+    val_data_dir: str = "data/minecraft_chunk64_224p_split/val"
     val_interval: int = 20_000
     val_steps: int = 50
     wandb_id: str = ""
