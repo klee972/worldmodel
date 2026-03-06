@@ -2,8 +2,20 @@
 
 A JAX + flax NNX-based implementation of the Dreamer4 world model. Trains a tokenizer and dynamics model using coinrun, VPT(minecraft), and CALVIN dataset.
 
+## Demo
+
+### CoinRun
+<video src="media/coinrun.mp4" controls width="640"></video>
+<video src="media/coinrun2.mp4" controls width="640"></video>
+
+### CALVIN
+<video src="media/calvin.mp4" controls width="640"></video>
+<video src="media/calvin2.mp4" controls width="640"></video>
+<video src="media/calvin3.mp4" controls width="640"></video>
+
 ## References
 
+This project is based on the following two repos:
 - [edwhu/dreamer4-jax](https://github.com/edwhu/dreamer4-jax)
 - [p-doom/jasmine](https://github.com/p-doom/jasmine)
 

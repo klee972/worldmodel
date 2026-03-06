@@ -3,6 +3,7 @@
 *.png
 *.gif
 *.mp4
+!media/*.mp4
 
 zzz*
 data/coinrun_episodes/
